@@ -70,8 +70,8 @@ if [ "$prepare_only" -eq 0 ]; then
 fi
 # Stage both files before changing an existing deployment. Only the known block
 # mapping emitted by our installers is patched; custom YAML shapes need review.
-compose_stage=''; env_stage=''
-trap 'if [ -n "$compose_stage" ]; then rm -f "$compose_stage"; fi; if [ -n "$env_stage" ]; then rm -f "$env_stage"; fi' EXIT
+compose_stage=''; env_stage=''; admin_env=''
+trap 'if [ -n "$compose_stage" ]; then rm -f "$compose_stage"; fi; if [ -n "$env_stage" ]; then rm -f "$env_stage"; fi; if [ -n "$admin_env" ]; then rm -f "$admin_env"; fi' EXIT
 compose_stage=$(mktemp "$output/.compose.upgrade-XXXXXXXX")
 compose_source="$template"
 if [ -f "$output/compose.yaml" ]; then compose_source="$output/compose.yaml"; fi
@@ -140,7 +140,9 @@ admin_password=''
 if ! grep -q '^SYNC_ADMIN_PASSWORD=.' "$env_stage"; then
   admin_password=$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')
   # Remove an old empty field before appending the newly generated password.
-  sed -i '/^SYNC_ADMIN_PASSWORD=/d' "$env_stage"
+  admin_env=$(mktemp "$output/.env.admin-XXXXXXXX")
+  sed '/^SYNC_ADMIN_PASSWORD=/d' "$env_stage" > "$admin_env"
+  mv "$admin_env" "$env_stage"
   printf 'SYNC_ADMIN_PASSWORD=%s\n' "$admin_password" >> "$env_stage"
 fi
 if [ ! -f "$output/.env" ] || ! cmp -s "$env_stage" "$output/.env"; then mv "$env_stage" "$output/.env"; fi
