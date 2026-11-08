@@ -24,46 +24,59 @@ ghcr.io/dalei1563/obsidian-lan-sync-couchdb:0.3.0
 
 GitHub 官方说明：[发布镜像](https://docs.github.com/en/actions/tutorials/publish-packages/publish-docker-images)、[GHCR 可见性和认证](https://docs.github.com/en/packages/working-with-a-github-packages-registry/working-with-the-container-registry)。
 
-## 1Panel 部署
+## SSH 一条命令部署（局域网 HTTP）
 
 使用 `compose.production.yaml`，其中只有 image，没有 build。生产服务器不需要 Node、npm 或源码编译。
 
-最快方式是在服务器上执行以下命令，替换服务地址（域名的 HTTPS 代理仍需在 1Panel 配置）：
+在服务器 SSH 终端执行下面一条命令即可。部署时无需填写 IP、域名或证书：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/dalei1563/obsidian-lan-sync/main/deployment/bootstrap-images.sh | bash -s -- --public-url https://notes.example.com --prepare-only
+curl -fsSL https://raw.githubusercontent.com/dalei1563/obsidian-lan-sync/main/deployment/bootstrap-images.sh | bash
 ```
 
-它下载固定提交的部署模板并校验 SHA-256，自动在 `/opt/lan-note-sync` 生成配置。然后从 1Panel 创建编排，选择该目录下的 compose.yaml，并确保同目录 .env 被加载。去掉 `--prepare-only` 会立即通过 Docker CLI 部署；此时容器可见，但编排的完整管理入口以 1Panel 对外部编排的支持为准。
+脚本下载固定提交的部署模板并校验 SHA-256，自动在 `/opt/lan-note-sync` 生成配置和随机数据库密码，拉取镜像并启动两个容器。快捷安装默认开放宿主机 27123 端口用于局域网 HTTP；CouchDB 不发布端口。1Panel 可以查看容器，无需额外导入或重复创建编排。既有配置不覆盖：若以前已生成回环监听配置，改 `.env` 中 `SYNC_LISTEN_ADDRESS=0.0.0.0` 后运行 `docker compose up -d`。
 
-可先上传包根的 `compose.production.yaml` 和 `deployment/setup-images.sh`（保持相对目录），在 Rocky Linux 终端生成配置：
+安装完成后，在客户端浏览器访问 `http://服务器IP:27123` 可检查服务页面。连接设备时，再使用该设备可达的地址生成邀请（替换示例 IP）：
+
+```bash
+cd /opt/lan-note-sync
+docker compose exec -T sync node dist/server/cli.cjs invite --url http://192.168.1.10:27123
+```
+
+`--url` 仅写入本次邀请，不改变监听地址，也不需要重新部署。插件通过这条邀请得知服务器地址。每台设备单独生成邀请。
+
+本机已经安装并运行 Docker 是前提。安装成功后两个容器应为 healthy。主机防火墙需要允许目标局域网设备访问 27123。
+
+## 可选：交给 1Panel 创建编排
+
+这只是面板管理偏好，不是 SSH 安装的必需步骤。需要面板创建编排时，给快捷安装命令追加 `--prepare-only`，它只生成配置，不启动容器。或者上传包根的 `compose.production.yaml` 和 `deployment/setup-images.sh`（保持相对目录），在 Rocky Linux 终端生成配置：
 
 ```bash
 bash deployment/setup-images.sh \
   --image-prefix ghcr.io/dalei1563/obsidian-lan-sync \
   --version 0.3.0 \
-  --public-url https://notes.example.com \
+  --expose-lan \
   --out /opt/lan-note-sync \
   --prepare-only
 ```
 
-脚本生成 `/opt/lan-note-sync/compose.yaml` 和 `.env`，数据库密码自动随机生成，文件仅当前用户可读写。已有配置不覆盖；更改镜像版本需要编辑原 `.env`。仅需临时内网 HTTP 时可改 PublicUrl 并加 `--expose-lan`。
+脚本生成 `/opt/lan-note-sync/compose.yaml` 和 `.env`，数据库密码自动随机生成，文件仅当前用户可读写。已有配置不覆盖；更改镜像版本需要编辑原 `.env`。`--public-url` 是可选项，只在希望部署后立即生成邀请时填写。
 
 在 **1Panel → 容器 → 编排 → 创建编排** 中使用生成的文件，确保 `.env` 位于同一部署目录，且编排项目名保持 `lan-note-sync-couch`。不同版本 1Panel 的文件导入/环境变量入口可能不同；以编排最终解析出的环境为准。首次启动拉取两个镜像并自动初始化数据库，无需创建 CouchDB 应用、填写 CORS 或开放 5984 端口。
 
-如果直接用终端部署，去掉 `--prepare-only`，脚本会执行 pull、up 和生成邀请；这属于外部创建的编排，1Panel 对其编排级启停能力可能与面板创建的编排不同。[1Panel 编排说明](https://1panel-dev.github.io/docs/v2/user_manual/containers/compose/)。
+SSH 创建的编排属于外部编排，1Panel 对其编排级启停能力可能与面板创建的编排不同，但不影响查看和管理容器。[1Panel 编排说明](https://1panel-dev.github.io/docs/v2/user_manual/containers/compose/)。
 
 检查：两个服务显示 healthy。在 sync 容器终端执行：
 
 ```text
-node dist/server/cli.cjs invite
+node dist/server/cli.cjs invite --url http://192.168.1.10:27123
 ```
 
 将生成的 Windows/macOS 安装命令发给用户即可。
 
 ## 反向代理和 Rocky Linux
 
-默认网关只发布到宿主机 `127.0.0.1:27123`，适合宿主机进程代理。域名配置 HTTPS，并把整个根路径转发给网关，包括 `/v1/` 和安装资源路径，允许至少 5 MiB 请求体及 30 秒处理时间。
+局域网 HTTP 不需要反向代理。选择 HTTPS 部署时，可把 `.env` 中 `SYNC_LISTEN_ADDRESS` 设为 `127.0.0.1`，由宿主机代理转发。域名配置 HTTPS，并把整个根路径转发给网关，包括 `/v1/` 和安装资源路径，允许至少 5 MiB 请求体及 30 秒处理时间。
 
 **如果 1Panel OpenResty 运行在容器中，代理目标 127.0.0.1 指向 OpenResty 自己。** 应把 sync 和 OpenResty 接入同一个用户定义 Docker 网络，给 sync 设置唯一网络别名（如 `lan-note-sync-gateway`），再代理到 `http://lan-note-sync-gateway:27123`。网络名称需根据服务器实际配置确认，不假定一定叫 `1panel-network`。CouchDB 继续只接入应用内部网络。
 
@@ -91,5 +104,5 @@ docker compose up -d --no-deps sync
 
 - 生产 Compose 已使用 Docker Compose 2.39.4 完成 config 校验，无源码 build。
 - 镜像配置生成测试通过：固定版本、自动随机密码、重复执行保留原配置、拒绝 latest。
-- 本次 npm test：29 项通过、7 项真实 CouchDB 测试未启动（此前 CouchDB 版本的 35 项完整测试已通过）。
+- 本次 npm test：30 项通过、7 项真实 CouchDB 测试未启动。新增测试验证无地址时直接执行拉取和启动，并将邀请生成延后；已有配置和密码保留。
 - GHCR 双架构构建发布、匿名 manifest 获取、Windows/macOS/Linux CI 已验证；未在用户实际 Rocky Linux / 1Panel 主机部署验收。

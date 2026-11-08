@@ -15,7 +15,9 @@ while [ "$#" -gt 0 ]; do
 done
 [[ "$prefix" =~ ^[a-z0-9.-]+(:[0-9]+)?/[a-z0-9._/-]+$ ]] || { printf '%s\n' 'Specify --image-prefix, for example ghcr.io/account/obsidian-lan-sync.' >&2; exit 1; }
 [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { printf '%s\n' 'Use a published fixed version, for example 0.3.0.' >&2; exit 1; }
-[[ "$public_url" =~ ^https?://[a-zA-Z0-9.-]+(:[0-9]+)?/?$ ]] || { printf '%s\n' 'Specify --public-url as the root HTTP(S) URL your devices can reach.' >&2; exit 1; }
+if [ -n "$public_url" ]; then
+  [[ "$public_url" =~ ^https?://[a-zA-Z0-9.-]+(:[0-9]+)?/?$ ]] || { printf '%s\n' 'Expected a root HTTP(S) URL your devices can reach.' >&2; exit 1; }
+fi
 template="$(cd "$(dirname "$0")/.." && pwd -P)/compose.production.yaml"
 [ -f "$template" ] || { printf '%s\n' 'Keep compose.production.yaml in the package root.' >&2; exit 1; }
 umask 077
@@ -33,4 +35,9 @@ fi
 docker compose version >/dev/null
 docker compose pull
 docker compose up -d --wait --wait-timeout 180
-docker compose exec -T sync node dist/server/cli.cjs invite
+printf 'Services are ready. Deployment directory: %s\n' "$(pwd -P)"
+if [ -n "$public_url" ]; then
+  docker compose exec -T sync node dist/server/cli.cjs invite --url "$public_url"
+else
+  printf '%s\n' 'No device address was required for deployment.' 'When connecting a device, generate an invite using the server address that device can reach:' 'docker compose exec -T sync node dist/server/cli.cjs invite --url http://SERVER_IP:27123'
+fi
