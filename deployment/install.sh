@@ -47,6 +47,8 @@ case "$server" in *[!a-zA-Z0-9:/._\[\]-]*|*@*|*\?*|*\#*) printf '%s\n' 'Invalid 
 curl_options=(--fail --silent --show-error --connect-timeout 15 --retry 2)
 # Local endpoints must not accidentally be sent through a global HTTP proxy.
 case "$server" in http://127.*|https://127.*|http://localhost*|https://localhost*|http://192.168.*|https://192.168.*|http://10.*|https://10.*|http://172.1[6-9].*|https://172.1[6-9].*|http://172.2[0-9].*|https://172.2[0-9].*|http://172.3[01].*|https://172.3[01].*) curl_options+=(--noproxy '*');; esac
+server_host=${server#*://}; server_host=${server_host%%:*}
+if [[ "$server_host" =~ ^100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then curl_options+=(--noproxy '*'); fi
 mkdir -p "$plugins"
 stage=$(mktemp -d "$plugins/.lan-note-sync-stage-XXXXXXXX")
 curl "${curl_options[@]}" --max-time 30 "$server/install/manifest" -o "$stage/plan.json"

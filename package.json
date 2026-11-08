@@ -1,9 +1,11 @@
 {
   "name": "obsidian-lan-sync",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "private": true,
   "description": "Self-hosted Markdown synchronization service and Obsidian desktop plugin",
-  "engines": { "node": ">=24.15.0 <25" },
+  "engines": {
+    "node": ">=24.15.0 <25"
+  },
   "scripts": {
     "build": "tsc --noEmit && node scripts/build.mjs",
     "dev": "node esbuild.config.mjs",

@@ -6,6 +6,7 @@ import { makeServer } from './http';
 import { encodeConnection, connectionUrl } from '../shared/connection';
 import { Distribution } from './distribution';
 import { processLock } from './process-lock';
+import { isTailnetIPv4 } from '../shared/network';
 
 function option(name: string, fallback = ''): string {
   const i = process.argv.indexOf('--' + name);
@@ -52,7 +53,7 @@ async function main() {
           const server = connectionUrl(option('url', process.env.SYNC_PUBLIC_URL ?? 'http://127.0.0.1:27123'));
           const connection = encodeConnection(server, result.code);
           const host = new URL(server).hostname;
-          const local = /^(localhost$|127\.|10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.|\[::1\])/.test(host);
+          const local = /^(localhost$|127\.|10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.|\[::1\])/.test(host) || isTailnetIPv4(host);
           const noProxy = local ? " --noproxy '*'" : '';
           const windowsFetch = local ? `(& { $w=New-Object Net.WebClient; $w.Proxy=$null; try { $w.DownloadString('${server}/install.ps1') } finally { $w.Dispose() } })` : `(Invoke-WebRequest -UseBasicParsing '${server}/install.ps1').Content`;
           console.log(`\nConnection code:\n${connection}\n\nWindows (run, then select the Vault if asked):\n& ([scriptblock]::Create(${windowsFetch})) -Connection '${connection}'\n\nmacOS (run, then select the Vault):\ncurl -fsS${noProxy} '${server}/install.sh' | bash -s -- --connection '${connection}'`);

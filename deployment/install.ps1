@@ -47,7 +47,7 @@ if (Test-Path -LiteralPath $target) {
 }
 Add-Type -AssemblyName System.Net.Http
 $handler = New-Object Net.Http.HttpClientHandler
-if ($server.Host -match '^(localhost$|127\.|10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.|\[?::1\]?$)') { $handler.UseProxy = $false }
+if ($server.Host -match '^(localhost$|127\.|10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.|\[?::1\]?$|100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.[0-9]{1,3}\.[0-9]{1,3}$)') { $handler.UseProxy = $false }
 $http = New-Object Net.Http.HttpClient($handler)
 $http.Timeout = [TimeSpan]::FromSeconds(30)
 $manifest = $http.GetStringAsync($server.AbsoluteUri.TrimEnd('/') + '/install/manifest').GetAwaiter().GetResult() | ConvertFrom-Json
