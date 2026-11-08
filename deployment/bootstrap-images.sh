@@ -1,7 +1,7 @@
 #!/bin/bash
 # Download the verified deployment templates for the first GHCR release.
 set -eu
-source_ref=39d3f8c94ad98e9abba9636af532d21756844bdf
+source_ref=15f7337c604dc17b10cb083f9696464670dcb603
 base="https://raw.githubusercontent.com/dalei1563/obsidian-lan-sync/$source_ref"
 stage=$(mktemp -d "${TMPDIR:-/tmp}/lan-note-sync.XXXXXXXX")
 cleanup() { rm -f "$stage/compose.production.yaml" "$stage/deployment/setup-images.sh"; rmdir "$stage/deployment" "$stage" 2>/dev/null || true; }
@@ -16,5 +16,5 @@ check_hash() {
   [ "$actual" = "$expected" ] || { printf '%s\n' 'Deployment download integrity check failed.' >&2; exit 1; }
 }
 check_hash "$stage/compose.production.yaml" b794da6368992a2655c62e11daa0217536f6a2e35f3559aa1564aa9ca8a41b07
-check_hash "$stage/deployment/setup-images.sh" 0ba5ab8b301209d111385567e2251a435ab908e9f70d97c9aa9a0fba31787ee5
-bash "$stage/deployment/setup-images.sh" --image-prefix ghcr.io/dalei1563/obsidian-lan-sync --version 0.3.0 --out /opt/lan-note-sync "$@"
+check_hash "$stage/deployment/setup-images.sh" daa569386288952243001e2a0bf5a022f307eb65879b18b626fcb41f2fe9cb5d
+bash "$stage/deployment/setup-images.sh" --image-prefix ghcr.io/dalei1563/obsidian-lan-sync --version 0.3.0 --out /opt/lan-note-sync --expose-lan "$@"
