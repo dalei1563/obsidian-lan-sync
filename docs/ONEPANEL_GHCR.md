@@ -2,15 +2,22 @@
 
 ## 发布状态
 
-项目已提供版本化镜像发布工作流和纯拉取的 Compose；**当前尚未发布到 GHCR**。下面的账号/仓库是示例，须替换成最终发布地址，并确认两个镜像均发布成功后部署。
+2026-11-08：**两个 0.3.0 镜像已发布，匿名拉取验证通过**，均包含 linux/amd64 和 linux/arm64。源码仓库为 [dalei1563/obsidian-lan-sync](https://github.com/dalei1563/obsidian-lan-sync)。
+
+```text
+ghcr.io/dalei1563/obsidian-lan-sync:0.3.0
+ghcr.io/dalei1563/obsidian-lan-sync-couchdb:0.3.0
+```
+
+发布记录：[GHCR 构建](https://github.com/dalei1563/obsidian-lan-sync/actions/runs/42461228885)；[Windows、macOS 与真实 CouchDB CI](https://github.com/dalei1563/obsidian-lan-sync/actions/runs/42461315953) 均成功。macOS CI 通过不等同于 macOS Obsidian GUI 实机验收。
 
 ## 镜像和更新约定
 
-发布 Git 标签 `v0.3.0` 后，`.github/workflows/publish-images.yml` 先构建并运行真实 CouchDB 回归测试，然后发布：
+主分支修改 package.json 版本号并提交，或发布匹配版本的 Git 标签，可触发 `.github/workflows/publish-images.yml`；也可在 Actions 手动运行。工作流先构建并运行真实 CouchDB 回归测试，然后发布：
 
 ```text
-ghcr.io/账号/仓库:0.3.0
-ghcr.io/账号/仓库-couchdb:0.3.0
+ghcr.io/dalei1563/obsidian-lan-sync:0.3.0
+ghcr.io/dalei1563/obsidian-lan-sync-couchdb:0.3.0
 ```
 
 工作流目标平台为 linux/amd64 和 linux/arm64；实际构建成功后才视为已支持。Tag、package.json 与插件 manifest.json 版本必须一致。使用 GitHub Actions 的 GITHUB_TOKEN，权限限定为发布作业的 packages:write；不在仓库或镜像中写入个人 Token。首次发布后检查两个 Package 的可见性，设为 Public 才能让服务器匿名拉取；公开源码仓库不等于镜像自动公开。
@@ -21,11 +28,19 @@ GitHub 官方说明：[发布镜像](https://docs.github.com/en/actions/tutorial
 
 使用 `compose.production.yaml`，其中只有 image，没有 build。生产服务器不需要 Node、npm 或源码编译。
 
+最快方式是在服务器上执行以下命令，替换服务地址（域名的 HTTPS 代理仍需在 1Panel 配置）：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/dalei1563/obsidian-lan-sync/main/deployment/bootstrap-images.sh | bash -s -- --public-url https://notes.example.com --prepare-only
+```
+
+它下载固定提交的部署模板并校验 SHA-256，自动在 `/opt/lan-note-sync` 生成配置。然后从 1Panel 创建编排，选择该目录下的 compose.yaml，并确保同目录 .env 被加载。去掉 `--prepare-only` 会立即通过 Docker CLI 部署；此时容器可见，但编排的完整管理入口以 1Panel 对外部编排的支持为准。
+
 可先上传包根的 `compose.production.yaml` 和 `deployment/setup-images.sh`（保持相对目录），在 Rocky Linux 终端生成配置：
 
 ```bash
 bash deployment/setup-images.sh \
-  --image-prefix ghcr.io/账号/仓库 \
+  --image-prefix ghcr.io/dalei1563/obsidian-lan-sync \
   --version 0.3.0 \
   --public-url https://notes.example.com \
   --out /opt/lan-note-sync \
@@ -77,4 +92,4 @@ docker compose up -d --no-deps sync
 - 生产 Compose 已使用 Docker Compose 2.39.4 完成 config 校验，无源码 build。
 - 镜像配置生成测试通过：固定版本、自动随机密码、重复执行保留原配置、拒绝 latest。
 - 本次 npm test：29 项通过、7 项真实 CouchDB 测试未启动（此前 CouchDB 版本的 35 项完整测试已通过）。
-- 未在实际 Rocky Linux / 1Panel 或 GHCR 远端发布环境验收。
+- GHCR 双架构构建发布、匿名 manifest 获取、Windows/macOS/Linux CI 已验证；未在用户实际 Rocky Linux / 1Panel 主机部署验收。

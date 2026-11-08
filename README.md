@@ -6,7 +6,7 @@
 
 ## 部署和接入
 
-**Rocky Linux / 1Panel 镜像部署**：使用 [GHCR 和 1Panel 指南](docs/ONEPANEL_GHCR.md) 及 `compose.production.yaml`。镜像发布工作流已准备，实际 GHCR 发布状态以指南为准；以下为本地源码构建方式。
+**Rocky Linux / 1Panel 镜像部署**：0.3.0 双架构镜像已发布到 `ghcr.io/dalei1563/obsidian-lan-sync` 和同名 `-couchdb` 包，均可匿名拉取。使用 [GHCR 和 1Panel 指南](docs/ONEPANEL_GHCR.md) 及 `compose.production.yaml`；以下为本地源码构建方式。
 
 先安装并启动 Docker Desktop（Linux 服务器使用 Docker Engine + Compose v2），解压服务部署包，在包根目录执行：
 
@@ -71,7 +71,7 @@ docker compose exec -T sync node dist/server/cli.cjs invite
 
 2026-11-08：35 项自动化测试通过，包含真实 CouchDB 测试、Windows PowerShell 安装器和 Bash 安装器测试。Windows Obsidian 1.12.7 已验证自动接入、首次预览、同步和设置界面。
 
-两个生产 Docker 镜像已实际构建并运行，通过强制终止网关再启动后的身份、正文及历史保留验证。当前 Docker 集成环境使用 WSL 隔离守护进程和 host-network 测试覆盖；默认 bridge 网络尚未单独实测。macOS 安装器按系统 Bash 3.2 编写，已在 Git Bash 测试核心逻辑；没有 Mac 实机验收。仓库包含 Windows/macOS CI 配置，尚未在远端执行。
+两个生产 Docker 镜像已实际构建并运行，通过强制终止网关再启动后的身份、正文及历史保留验证。当前 Docker 集成环境使用 WSL 隔离守护进程和 host-network 测试覆盖；用户实际 Rocky Linux/1Panel 尚未验收。GHCR 双架构发布及 Windows/macOS/真实 CouchDB 远端 CI 已通过；macOS 安装脚本已在原生 CI 执行，但 macOS Obsidian GUI 尚未实机验收。
 
 详见[设计](docs/COUCHDB_DESIGN.md)、[部署与运维](docs/SERVER_QUICKSTART.md)、[测试记录](docs/COUCHDB_TEST_REPORT.md)。
 

@@ -2,6 +2,8 @@
 
 日期：2026-11-08（北京时间）。结论：独立 CouchDB 版已形成可部署试用包；未宣称完成跨平台生产验收。
 
+补充：GHCR 0.3.0 双架构镜像已发布，匿名拉取 manifest 验证通过。[发布工作流](https://github.com/dalei1563/obsidian-lan-sync/actions/runs/42461228885) 与 [Windows/macOS/真实 CouchDB CI](https://github.com/dalei1563/obsidian-lan-sync/actions/runs/42461315953) 均通过。新增镜像部署配置测试后，共有 36 项测试；各平台按依赖跳过不可运行项。Mac 原生安装脚本路径已在 CI 执行，Obsidian GUI 和用户 Rocky Linux/1Panel 尚未验收。下文为最初本地验收记录。
+
 ## 环境
 
 - Windows、Node.js 24.15.0、Obsidian 1.12.7，插件 0.3.0，协议版本 2。
@@ -60,7 +62,7 @@
 ## 尚未验收和限制
 
 - 没有 Mac 实机；Bash 脚本核心路径在 Git Bash 验证，原生 osascript 选库与 macOS Obsidian 待验收。
-- Windows/macOS CI 配置已写入，但没有远端 CI 执行记录。
+- Windows/macOS CI 已执行通过，记录见顶部补充。
 - 默认 Docker bridge、实际跨机 HTTPS、NAS 文件权限、持续运行、万人规模/大型历史库未验收。
 - 仅 Markdown，不含图片/PDF 附件、移动端、E2EE、自动升级或多副本网关。
 - JSONL 文档导出经过引用与哈希校验；没有自动恢复导入命令。灾备须完整备份两卷与配置。
