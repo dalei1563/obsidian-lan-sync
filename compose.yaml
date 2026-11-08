@@ -1,0 +1,48 @@
+name: lan-note-sync-couch
+services:
+  couchdb:
+    build:
+      context: .
+      dockerfile: deployment/CouchDB.Dockerfile
+    restart: unless-stopped
+    environment:
+      COUCHDB_USER: ${COUCHDB_USER:?Run deployment setup first}
+      COUCHDB_PASSWORD: ${COUCHDB_PASSWORD:?Run deployment setup first}
+    volumes:
+      - couch-data:/opt/couchdb/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS -u \"$$COUCHDB_USER:$$COUCHDB_PASSWORD\" http://127.0.0.1:5984/_up >/dev/null"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    security_opt: ["no-new-privileges:true"]
+  sync:
+    build: .
+    restart: unless-stopped
+    command: ["node", "dist/server/cli.cjs", "start", "--allow-insecure-lan"]
+    depends_on:
+      couchdb:
+        condition: service_healthy
+    environment:
+      SYNC_BACKEND: couchdb
+      COUCHDB_URL: http://couchdb:5984
+      COUCHDB_DATABASE: lan_note_sync
+      COUCHDB_USER: ${COUCHDB_USER}
+      COUCHDB_PASSWORD: ${COUCHDB_PASSWORD}
+      SYNC_PUBLIC_URL: ${SYNC_PUBLIC_URL:-http://127.0.0.1:27123}
+    ports:
+      - "${SYNC_LISTEN_ADDRESS:-127.0.0.1}:27123:27123"
+    volumes:
+      - gateway-data:/data
+    read_only: true
+    tmpfs: ["/tmp"]
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: ["ALL"]
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:27123/v1/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+volumes:
+  couch-data:
+  gateway-data:

@@ -1,0 +1,9 @@
+node_modules
+dist
+.test-build
+.test-runtime
+sync-data
+backups
+.git
+.env*
+*.key

@@ -1,0 +1,81 @@
+name: Publish versioned GHCR images
+on:
+  push:
+    tags: ['v*.*.*']
+    branches: [main]
+    paths: ['package.json']
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: publish-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    services:
+      couchdb:
+        image: apache/couchdb:3.5.3
+        env:
+          COUCHDB_USER: ci_admin
+          COUCHDB_PASSWORD: ci-only-ephemeral-password
+        ports: ['5984:5984']
+        options: >-
+          --health-cmd "curl -fsS -u ci_admin:ci-only-ephemeral-password http://127.0.0.1:5984/_up"
+          --health-interval 5s --health-timeout 5s --health-retries 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.15.0
+          cache: npm
+      - run: npm ci
+      - name: Check release version
+        run: node -e "const v=require('./package.json').version; if(!/^\d+\.\d+\.\d+$/.test(v) || (process.env.GITHUB_REF.startsWith('refs/tags/') && process.env.GITHUB_REF_NAME!=='v'+v) || require('./manifest.json').version!==v) throw Error('Release, package and plugin versions must match')"
+      - run: npm run build
+      - name: Configure isolated CouchDB tests
+        run: |
+          mkdir -p .test-runtime
+          node -e "require('fs').writeFileSync('.test-runtime/couch-test.json',JSON.stringify({url:'http://127.0.0.1:5984',user:'ci_admin',password:'ci-only-ephemeral-password'}))"
+      - run: npm run test:couch
+  publish:
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      matrix:
+        include:
+          - dockerfile: Dockerfile
+            suffix: ''
+          - dockerfile: deployment/CouchDB.Dockerfile
+            suffix: '-couchdb'
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compute image coordinates
+        id: image
+        env:
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          echo "name=ghcr.io/${REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+          version=$(node -p "require('./package.json').version")
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.image.outputs.name }}${{ matrix.suffix }}:${{ steps.image.outputs.version }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ steps.image.outputs.version }}

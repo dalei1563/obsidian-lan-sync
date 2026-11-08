@@ -1,0 +1,11 @@
+import { build } from 'esbuild';
+import { mkdir, copyFile } from 'node:fs/promises';
+await build({ entryPoints: ['src/main.ts'], bundle: true, external: ['obsidian', 'electron'], platform: 'node', format: 'cjs', target: 'es2020', outfile: 'main.js' });
+await build({ entryPoints: ['server/cli.ts'], bundle: true, platform: 'node', format: 'cjs', target: 'node24', outfile: 'dist/server/cli.cjs' });
+await mkdir('dist/plugin/lan-note-sync', { recursive: true });
+for (const file of ['main.js', 'manifest.json', 'styles.css']) await copyFile(file, 'dist/plugin/lan-note-sync/' + file);
+await copyFile('docs/SERVER_QUICKSTART.md', 'dist/server/README.md');
+await mkdir('dist/distribution/plugin', { recursive: true });
+for (const file of ['main.js', 'manifest.json', 'styles.css']) await copyFile(file, 'dist/distribution/plugin/' + file);
+for (const file of ['install.ps1', 'install.sh']) await copyFile('deployment/' + file, 'dist/distribution/' + file);
+console.log('Built server and installable plugin: dist/');

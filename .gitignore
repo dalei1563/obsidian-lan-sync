@@ -1,0 +1,13 @@
+node_modules/
+main.js
+data.json
+.env*
+!.env.example
+dist/
+.test-build/
+.test-runtime/
+sync-data/
+backups/
+*.key
+docs/API_VERIFICATION.md
+Obsidian_飞书同步插件_SPEC*.md

@@ -1,0 +1,48 @@
+name: Build and verify
+on: [push, pull_request, workflow_dispatch]
+jobs:
+  desktop:
+    strategy:
+      matrix:
+        os: [windows-latest, macos-14]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.15.0
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - run: npm test
+      - uses: actions/upload-artifact@v4
+        with:
+          name: desktop-${{ matrix.os }}
+          path: dist/
+  couchdb:
+    runs-on: ubuntu-latest
+    services:
+      couchdb:
+        image: apache/couchdb:3.5.3
+        env:
+          COUCHDB_USER: ci_test_admin
+          COUCHDB_PASSWORD: ci-only-ephemeral-test-password
+        ports: ["5984:5984"]
+        options: >-
+          --health-cmd "curl -fsS -u ci_test_admin:ci-only-ephemeral-test-password http://127.0.0.1:5984/_up"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.15.0
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - name: Configure isolated database tests
+        run: |
+          mkdir -p .test-runtime
+          node -e "require('fs').writeFileSync('.test-runtime/couch-test.json',JSON.stringify({url:'http://127.0.0.1:5984',user:'ci_test_admin',password:'ci-only-ephemeral-test-password'}))"
+      - run: npm run test:couch

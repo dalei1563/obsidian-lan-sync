@@ -1,0 +1,11 @@
+import { build } from 'esbuild';
+import { readdir, mkdir } from 'node:fs/promises';
+import { spawnSync } from 'node:child_process';
+import { resolve } from 'node:path';
+await mkdir('.test-build', { recursive: true });
+const tests = (await readdir('tests')).filter(f => f.endsWith('.test.ts'));
+for (const test of tests) await build({ entryPoints: ['tests/' + test], bundle: true, platform: 'node', format: 'cjs', target: 'node24', outfile: '.test-build/' + test.replace('.ts', '.cjs') });
+const environment = { ...process.env };
+if (process.argv.includes('--couch')) environment.COUCH_TEST_CONFIG = environment.COUCH_TEST_CONFIG ?? resolve('.test-runtime/couch-test.json');
+const result = spawnSync(process.execPath, ['--test', ...tests.map(f => '.test-build/' + f.replace('.ts', '.cjs'))], { stdio: 'inherit', env: environment });
+process.exitCode = result.status ?? 1;
