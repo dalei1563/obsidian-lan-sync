@@ -64,10 +64,10 @@ export class Store implements Backend {
     return { code, vaultId: vid, expires };
   }
   pair(code: string, deviceName: string): PairResult {
-    if (!/^[a-f0-9]{24}$/.test(code) || !deviceName.trim() || deviceName.length > 100) throw new SyncError('pair_denied', '配对码无效或已过期', 401);
+    if (!/^[a-f0-9]{24}$/.test(code) || !deviceName.trim() || deviceName.length > 100) throw new SyncError('pair_denied', '连接码已过期、无效或已被其他设备使用，请在原仓库为这台设备重新生成连接码', 401);
     return this.transaction(() => {
       const row = this.db.prepare('SELECT p.vault_id,v.name FROM pairing p JOIN vaults v ON v.id=p.vault_id WHERE code_hash=? AND expires>?').get(hash(code), Date.now()) as Row | undefined;
-      if (!row) throw new SyncError('pair_denied', '配对码无效或已过期', 401);
+      if (!row) throw new SyncError('pair_denied', '连接码已过期、无效或已被其他设备使用，请在原仓库为这台设备重新生成连接码', 401);
       const token = randomBytes(32).toString('hex'), deviceId = id();
       this.db.prepare('INSERT INTO devices(id,vault_id,name,token_hash) VALUES (?,?,?,?)').run(deviceId, row.vault_id, deviceName, hash(token));
       this.db.prepare('DELETE FROM pairing WHERE code_hash=?').run(hash(code));

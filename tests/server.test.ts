@@ -10,10 +10,10 @@ test('pairing is single use, expires, is vault-scoped, and can be revoked', asyn
   const f = await fixture(t);
   const p = f.store.createPair('Other');
   const paired = f.store.pair(p.code, 'new');
-  assert.throws(() => f.store.pair(p.code, 'again'), /配对码/);
+  assert.throws(() => f.store.pair(p.code, 'again'), /原仓库为这台设备重新生成连接码/);
   const expired = f.store.createPair('Other', paired.vaultId);
   f.store.db.prepare('UPDATE pairing SET expires=0 WHERE code_hash=?').run(hash(expired.code));
-  assert.throws(() => f.store.pair(expired.code, 'late'), /配对码/);
+  assert.throws(() => f.store.pair(expired.code, 'late'), /原仓库为这台设备重新生成连接码/);
   const cross = await transport(f.url + `/v1/vaults/${paired.vaultId}/state`, 'GET', { Authorization: 'Bearer ' + f.first.token });
   assert.equal(cross.status, 403);
   f.store.db.prepare('UPDATE devices SET revoked=1 WHERE id=?').run(f.first.deviceId);

@@ -1,7 +1,7 @@
 {
   "id": "lan-note-sync",
   "name": "LAN Note Sync",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "minAppVersion": "1.11.4",
   "description": "Sync Markdown notes with your self-hosted server, with offline recovery and explicit conflicts.",
   "author": "LAN Note Sync Contributors",

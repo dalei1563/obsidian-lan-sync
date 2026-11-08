@@ -179,17 +179,17 @@ export class CouchStore implements Backend {
   }
   pair(code: string, name: string, requestId: string = id()): Promise<PairResult> {
     return this.serial(async () => {
-      if (!/^[a-f0-9]{24}$/.test(code) || !name.trim() || name.length > 100) throw new SyncError('pair_denied', '连接码无效或已过期，请向管理员重新获取', 401);
+      if (!/^[a-f0-9]{24}$/.test(code) || !name.trim() || name.length > 100) throw new SyncError('pair_denied', '连接码已过期、无效或已被其他设备使用，请在原仓库为这台设备重新生成连接码', 401);
       assertId(requestId);
       let pairing = await this.doc('pair:' + hash(code));
-      if (!pairing || pairing.expires <= Date.now() || (pairing.requestId && pairing.requestId !== requestId)) throw new SyncError('pair_denied', '连接码无效或已被其他设备使用', 401);
+      if (!pairing || pairing.expires <= Date.now() || (pairing.requestId && pairing.requestId !== requestId)) throw new SyncError('pair_denied', '连接码已过期、无效或已被其他设备使用，请在原仓库为这台设备重新生成连接码', 401);
       if (!pairing.requestId) {
         pairing = { ...pairing, requestId, deviceName: name };
         try { await this.put(pairing); }
         catch (e) {
           if (!(e instanceof SyncError && e.code === 'couch_conflict')) throw e;
           pairing = await this.doc(pairing._id);
-          if (!pairing || pairing.requestId !== requestId) throw new SyncError('pair_denied', '连接码已被其他设备使用', 401);
+          if (!pairing || pairing.requestId !== requestId) throw new SyncError('pair_denied', '连接码已过期、无效或已被其他设备使用，请在原仓库为这台设备重新生成连接码', 401);
         }
       }
       const token = createHmac('sha256', this.meta.pairSecret).update(code).digest('hex');

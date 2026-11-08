@@ -7,9 +7,10 @@ import { DiskState } from './sync/disk-state';
 import { Engine, newState } from './sync/engine';
 import { ObsidianVault } from './sync/obsidian-vault';
 import { normalizeServer, Remote, Transport } from './sync/remote';
-import { decodeConnection } from '../shared/connection';
+import { Connection, decodeConnection } from '../shared/connection';
 import { Enrollment } from './sync/enrollment';
 import { normalizeExclusions } from '../shared/exclusions';
+import { DeadlineError, SingleFlight, withDeadline } from './sync/async-flow';
 
 export default class LanSyncPlugin extends Plugin {
   settings: LanSettings = { ...DEFAULT_SETTINGS, excludedPaths: [] };
@@ -23,11 +24,24 @@ export default class LanSyncPlugin extends Plugin {
   private nextAttempt = 0;
   private working = false;
   private disposed = false;
+  private settingsTab?: LanSettingTab;
+  private readonly connectionFlow = new SingleFlight();
+  private readonly previewFlow = new SingleFlight();
+  private previewDialog?: Modal;
+  private readonly workflowDialogs = new Set<Modal>();
+  get connecting(): boolean { return this.connectionFlow.busy; }
+  get previewing(): boolean { return this.previewFlow.busy; }
+  get unloaded(): boolean { return this.disposed; }
   readonly transport: Transport = async (url, method, headers, body) => {
     try {
-      const response = await requestUrl({ url, method, headers, body: body ? Uint8Array.from(body).buffer : undefined, throw: false });
+      this.ensureActive();
+      const response = await withDeadline(requestUrl({ url, method, headers, body: body ? Uint8Array.from(body).buffer : undefined, throw: false }), 20000, '同步服务响应超时，请检查网络后重试；本地笔记与连接信息已保留');
+      this.ensureActive();
       return { status: response.status, body: Buffer.from(response.arrayBuffer) };
-    } catch { throw new Error('无法连接同步服务，请检查网络、地址和证书；本地修改仍保留'); }
+    } catch (e) {
+      if (e instanceof DeadlineError || this.disposed) throw e;
+      throw new Error('无法连接同步服务，请检查网络、地址和证书；本地修改仍保留');
+    }
   };
   async onload(): Promise<void> {
     const raw = (await this.loadData()) ?? {};
@@ -40,7 +54,7 @@ export default class LanSyncPlugin extends Plugin {
     this.bar = this.addStatusBarItem();
     this.bar.addClass('lan-sync-status'); this.bar.onclick = () => void this.action(() => this.showIssues());
     this.setStatus('未配对');
-    this.addSettingTab(new LanSettingTab(this.app, this));
+    this.settingsTab = new LanSettingTab(this.app, this); this.addSettingTab(this.settingsTab);
     this.registerObsidianProtocolHandler('lan-note-sync', params => { if (params.connection) void this.action(() => this.importConnection(params.connection)); });
     this.addRibbonIcon('refresh-cw', '局域网同步', () => void this.action(() => this.sync(true)));
     this.addCommand({ id: 'sync-now', name: '立即同步', callback: () => void this.action(() => this.sync(true)) });
@@ -77,6 +91,8 @@ export default class LanSyncPlugin extends Plugin {
   }
   onunload(): void {
     this.disposed = true;
+    for (const modal of this.workflowDialogs) modal.close();
+    this.workflowDialogs.clear();
     if (this.debounce) window.clearTimeout(this.debounce);
     const disk = this.disk;
     void (this.engine?.stop() ?? Promise.resolve()).finally(() => disk?.close());
@@ -84,29 +100,63 @@ export default class LanSyncPlugin extends Plugin {
   setStatus(message: string): void {
     if (this.disposed) return;
     this.status = message; this.bar?.setText('局域网同步：' + message); this.bar?.setAttribute('aria-label', '局域网同步：' + message);
+    this.settingsTab?.updateStatus(message);
   }
+  private ensureActive(): void { if (this.disposed) throw new Error('插件已卸载，请重新启用后重试'); }
+  private refreshSettings(): void { if (!this.disposed) this.settingsTab?.refreshBinding(); }
   saveSettings(): Promise<void> { return this.saveData(this.settings); }
   private enrollment(): Enrollment {
     const adapter = this.app.vault.adapter;
     if (!(adapter instanceof FileSystemAdapter)) throw new Error('此版本仅支持 Windows 和 macOS 桌面端');
     return new Enrollment(join(adapter.getBasePath(), this.app.vault.configDir, 'plugins', this.manifest.id));
   }
-  async importConnection(value: string): Promise<void> {
-    if (this.settings.vaultId) throw new Error('这个 Vault 已经连接，请使用立即同步；更换连接前需保留现有基线');
-    const connection = decodeConnection(value);
+  importConnection(value: string): Promise<void> {
+    let connection: Connection;
+    try { this.ensureActive(); connection = decodeConnection(value); } catch (e) { return Promise.reject(e); }
+    return this.connectionFlow.run(connection.server + '\n' + connection.code, () => this.connect(connection));
+  }
+  private async connect(connection: Connection): Promise<void> {
+    this.ensureActive();
+    if (this.settings.vaultId) throw new Error('这个 Vault 已经连接，请使用首次同步预览或立即同步；更换连接前需保留现有基线');
     const u = new URL(connection.server);
     const httpLan = u.protocol === 'http:' && !['127.0.0.1', 'localhost', '[::1]'].includes(u.hostname);
     if (httpLan) {
-      const accepted = await new Promise<boolean>(resolve => {
-        const modal = new Modal(this.app); modal.titleEl.setText('确认内网测试连接');
-        modal.contentEl.createEl('p', { text: `管理员提供的 ${u.host} 使用 HTTP，连接码与笔记会明文传输。请仅在可信内网测试时继续；正式使用请向管理员获取 HTTPS 连接码。` });
-        modal.onClose = () => resolve(false);
-        new Setting(modal.contentEl).addButton(b => b.setButtonText('取消').onClick(() => modal.close())).addButton(b => b.setButtonText('继续内网测试').onClick(() => { resolve(true); modal.close(); })); modal.open();
-      });
-      if (!accepted) return;
+      let decide!: (accepted: boolean) => void;
+      const decision = new Promise<boolean>(resolve => { decide = resolve; });
+      const modal = new Modal(this.app); modal.titleEl.setText('确认内网测试连接');
+      modal.contentEl.createEl('p', { text: `管理员提供的 ${u.host} 使用 HTTP，连接码与笔记会明文传输。请仅在可信内网测试时继续；正式使用请向管理员获取 HTTPS 连接码。` });
+      modal.onClose = () => decide(false);
+      new Setting(modal.contentEl).addButton(b => b.setButtonText('取消').onClick(() => modal.close())).addButton(b => b.setButtonText('继续内网测试').onClick(() => { decide(true); modal.close(); }));
+      await this.openMainModal(modal);
+      const accepted = await decision; this.ensureActive();
+      if (!accepted) { this.setStatus('已取消连接，连接码已保留'); return; }
     }
-    this.settings.server = connection.server; this.settings.allowHttp = httpLan;
-    await this.pair(connection.code); await this.preview();
+    this.setStatus('正在配对…');
+    await this.pair(connection.code, connection.server, httpLan); this.ensureActive();
+    try { await this.preview(); }
+    catch (e) { throw new Error('已配对，首次同步预览未完成：' + (e instanceof Error ? e.message : '请稍后重试') + '。请在设置中重试预览，无需重新输入连接码。'); }
+  }
+  private async focusMainWindow(): Promise<void> {
+    this.ensureActive();
+    // Obsidian 1.15 settings may live in a native popout. Modal.open() chooses
+    // activeWindow after our network awaits, so close that popout before opening.
+    const settings: unknown = (this.app as unknown as { setting?: unknown }).setting;
+    if (settings && typeof settings === 'object' && 'isOpen' in settings && settings.isOpen === true && 'close' in settings && typeof settings.close === 'function') settings.close();
+    const mainWindow = this.app.workspace.containerEl.ownerDocument.defaultView;
+    if (!mainWindow || mainWindow.closed) throw new Error('Obsidian 主窗口不可用，请重新打开笔记库后重试');
+    for (let attempt = 0; attempt < 20; attempt++) {
+      mainWindow.focus();
+      await new Promise<void>(resolve => window.setTimeout(resolve, 25));
+      this.ensureActive();
+      if (!mainWindow.closed && activeWindow === mainWindow) return;
+    }
+    throw new Error('请切回 Obsidian 主窗口，然后重新打开设置重试；当前绑定已保留');
+  }
+  private async openMainModal(modal: Modal): Promise<void> {
+    await this.focusMainWindow(); this.ensureActive();
+    const onClose = modal.onClose.bind(modal);
+    modal.onClose = () => { this.workflowDialogs.delete(modal); onClose(); };
+    this.workflowDialogs.add(modal); modal.open();
   }
   async diagnose(): Promise<void> {
     const url = normalizeServer(this.settings.server, this.settings.allowHttp);
@@ -118,7 +168,7 @@ export default class LanSyncPlugin extends Plugin {
     this.setStatus('服务连接正常'); new Notice('同步服务与数据库连接正常。');
   }
   async action(fn: () => Promise<void>): Promise<void> {
-    try { await fn(); } catch (e) { const message = e instanceof Error ? e.message : '操作失败'; this.setStatus(message); new Notice(message, 8000); }
+    try { await fn(); } catch (e) { if (this.disposed) return; const message = e instanceof Error ? e.message : '操作失败'; this.setStatus(message); new Notice(message, 8000); }
   }
   async setup(): Promise<void> {
     if (this.engine || !this.settings.vaultId) return;
@@ -136,31 +186,50 @@ export default class LanSyncPlugin extends Plugin {
       this.setStatus(!state.initialized ? '已配对，等待首次同步预览' : this.settings.enabled ? '等待同步' : '自动同步已暂停');
     } catch (e) { this.disk.close(); this.disk = undefined; throw e; }
   }
-  async pair(code: string): Promise<void> {
+  async pair(code: string, server = this.settings.server, allowHttp = this.settings.allowHttp): Promise<void> {
+    this.ensureActive();
     if (this.settings.vaultId) throw new Error('此 Vault 已绑定；重新安装或换设备前请先保留同步基线与恢复快照');
-    const url = normalizeServer(this.settings.server, this.settings.allowHttp);
+    const url = normalizeServer(server, allowHttp);
     const claim = this.enrollment().claim(url, code.trim());
     const result = await Remote.pair(url, code.trim(), hostname(), this.transport, claim);
+    this.ensureActive();
+    if (this.settings.vaultId) throw new Error('此 Vault 已保存另一份绑定，已停止重复配对');
+    const previous = { ...this.settings };
     this.app.secretStorage.setSecret(this.settings.secretId, result.token);
-    Object.assign(this.settings, { server: url, vaultId: result.vaultId, vaultName: result.vaultName, deviceId: result.deviceId, serverId: result.serverId, enabled: false });
-    await this.saveSettings(); await this.setup();
+    Object.assign(this.settings, { server: url, allowHttp, vaultId: result.vaultId, vaultName: result.vaultName, deviceId: result.deviceId, serverId: result.serverId, enabled: false });
+    try { await this.saveSettings(); } catch (e) { Object.assign(this.settings, previous); throw e; }
+    this.ensureActive(); this.refreshSettings();
+    await this.setup(); this.ensureActive();
     this.enrollment().complete();
     new Notice('配对成功。先预览首次同步，再确认开始。');
   }
-  async preview(): Promise<void> {
+  preview(): Promise<void> {
+    const result = this.previewFlow.run('first-sync', () => this.runPreview());
+    void result.then(() => this.refreshSettings(), () => this.refreshSettings());
+    return result;
+  }
+  private async runPreview(): Promise<void> {
+    this.ensureActive();
+    if (this.previewDialog) { await this.focusMainWindow(); return; }
+    this.refreshSettings(); this.setStatus('正在生成首次同步预览…');
     await this.setup();
+    this.ensureActive();
     if (!this.engine) throw new Error('请先输入配对码连接服务');
     if (this.engine.state.initialized) throw new Error('此 Vault 已初始化，请使用立即同步');
     const p = await this.engine.preview();
+    this.ensureActive();
     const modal = new Modal(this.app); modal.titleEl.setText('首次同步预览');
+    modal.onClose = () => { this.previewDialog = undefined; if (!this.engine?.state.initialized && !this.disposed) this.setStatus('已配对，首次同步尚未开始'); };
     modal.contentEl.createEl('p', { text: `本地 ${p.local} 篇，远端 ${p.remote} 个逻辑文件。` });
     modal.contentEl.createEl('p', { text: `预计上传 ${p.upload} 篇、下载 ${p.download} 篇、相同 ${p.same} 篇、需选择版本 ${p.conflicts} 项。` });
     modal.contentEl.createEl('p', { text: '同名不同内容将保留双方并等待处理。首次绑定不会把缺少的文件视为删除。' });
     new Setting(modal.contentEl).addButton(b => b.setButtonText('取消').onClick(() => modal.close())).addButton(b => b.setButtonText('确认并开始同步').setCta().onClick(() => {
       b.setDisabled(true); void this.action(async () => {
-        await this.engine!.initialize(); this.settings.enabled = true; await this.saveSettings(); modal.close(); await this.sync(true);
+        this.ensureActive(); await this.engine!.initialize(); this.ensureActive(); this.settings.enabled = true; await this.saveSettings(); this.ensureActive(); modal.close(); this.refreshSettings(); await this.sync(true);
       }).finally(() => b.setDisabled(false));
-    })); modal.open();
+    }));
+    this.previewDialog = modal;
+    try { await this.openMainModal(modal); } catch (e) { this.previewDialog = undefined; throw e; }
   }
   async sync(manual: boolean): Promise<void> {
     if (this.disposed || this.working) return;
