@@ -6,7 +6,7 @@
 
 ## 部署和接入
 
-**Rocky Linux / 1Panel 镜像部署**：0.3.0 双架构镜像已发布到 `ghcr.io/dalei1563/obsidian-lan-sync` 和同名 `-couchdb` 包，均可匿名拉取。使用 [GHCR 和 1Panel 指南](docs/ONEPANEL_GHCR.md) 及 `compose.production.yaml`；以下为本地源码构建方式。
+**Rocky Linux / 1Panel 镜像部署**：0.3.1 双架构镜像已发布到 `ghcr.io/dalei1563/obsidian-lan-sync` 和同名 `-couchdb` 包。0.3.1 修复 Tailscale 安装时的代理绕过问题，已完成[跨主机测试](docs/TAILSCALE_TEST_REPORT.md)。使用 [GHCR 和 1Panel 指南](docs/ONEPANEL_GHCR.md) 及 `compose.production.yaml`；以下为本地源码构建方式。
 
 数据盘安装可在快捷 SSH 安装命令末尾加 `--data-dir /data/lan-note-sync`，将数据库、网关状态和部署配置都放到该目录；已有部署不会自动迁移，详见指南。
 

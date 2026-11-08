@@ -2,11 +2,11 @@
 
 ## 发布状态
 
-2026-11-08：**两个 0.3.0 镜像已发布，匿名拉取验证通过**，均包含 linux/amd64 和 linux/arm64。源码仓库为 [dalei1563/obsidian-lan-sync](https://github.com/dalei1563/obsidian-lan-sync)。
+2026-11-08：**两个 0.3.1 镜像已发布**，支持 linux/amd64 和 linux/arm64；0.3.1 修复通过 Tailscale 地址安装时的代理绕过问题。源码仓库为 [dalei1563/obsidian-lan-sync](https://github.com/dalei1563/obsidian-lan-sync)。[跨主机测试记录](TAILSCALE_TEST_REPORT.md)。
 
 ```text
-ghcr.io/dalei1563/obsidian-lan-sync:0.3.0
-ghcr.io/dalei1563/obsidian-lan-sync-couchdb:0.3.0
+ghcr.io/dalei1563/obsidian-lan-sync:0.3.1
+ghcr.io/dalei1563/obsidian-lan-sync-couchdb:0.3.1
 ```
 
 发布记录：[GHCR 构建](https://github.com/dalei1563/obsidian-lan-sync/actions/runs/42461228885)；[Windows、macOS 与真实 CouchDB CI](https://github.com/dalei1563/obsidian-lan-sync/actions/runs/42461315953) 均成功。macOS CI 通过不等同于 macOS Obsidian GUI 实机验收。
@@ -16,8 +16,8 @@ ghcr.io/dalei1563/obsidian-lan-sync-couchdb:0.3.0
 主分支修改 package.json 版本号并提交，或发布匹配版本的 Git 标签，可触发 `.github/workflows/publish-images.yml`；也可在 Actions 手动运行。工作流先构建并运行真实 CouchDB 回归测试，然后发布：
 
 ```text
-ghcr.io/dalei1563/obsidian-lan-sync:0.3.0
-ghcr.io/dalei1563/obsidian-lan-sync-couchdb:0.3.0
+ghcr.io/dalei1563/obsidian-lan-sync:0.3.1
+ghcr.io/dalei1563/obsidian-lan-sync-couchdb:0.3.1
 ```
 
 工作流目标平台为 linux/amd64 和 linux/arm64；实际构建成功后才视为已支持。Tag、package.json 与插件 manifest.json 版本必须一致。使用 GitHub Actions 的 GITHUB_TOKEN，权限限定为发布作业的 packages:write；不在仓库或镜像中写入个人 Token。首次发布后检查两个 Package 的可见性，设为 Public 才能让服务器匿名拉取；公开源码仓库不等于镜像自动公开。
@@ -79,7 +79,7 @@ curl -fsSL https://raw.githubusercontent.com/dalei1563/obsidian-lan-sync/main/de
 ```bash
 bash deployment/setup-images.sh \
   --image-prefix ghcr.io/dalei1563/obsidian-lan-sync \
-  --version 0.3.0 \
+  --version 0.3.1 \
   --expose-lan \
   --out /opt/lan-note-sync \
   --prepare-only

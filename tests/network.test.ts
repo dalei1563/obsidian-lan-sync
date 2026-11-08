@@ -8,12 +8,12 @@ import { id } from '../shared/protocol';
 import { decodeConnection } from '../shared/connection';
 
 const cases: [string, boolean][] = [
-  ['100.63.255.255', false], ['100.64.0.0', true], ['100.90.101.105', true],
+  ['100.63.255.255', false], ['100.64.0.0', true], ['100.64.10.20', true],
   ['100.127.255.255', true], ['100.128.0.0', false], ['100.90.example.com', false],
 ];
 test('Tailscale proxy bypass matches precisely the shared IPv4 range, including both boundaries', () => {
   for (const [host, expected] of cases) assert.equal(isTailnetIPv4(host), expected, host);
-  for (const host of ['100.90.256.1', '100.90.1', '100.90.1.2.example.com', 'https://100.90.101.105']) assert.equal(isTailnetIPv4(host), false, host);
+  for (const host of ['100.90.256.1', '100.90.1', '100.90.1.2.example.com', 'https://100.64.10.20']) assert.equal(isTailnetIPv4(host), false, host);
 });
 
 function runtime(t: TestContext) {
