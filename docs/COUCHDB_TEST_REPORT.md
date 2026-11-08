@@ -61,6 +61,16 @@
 
 ## 尚未验收和限制
 
+### 数据盘补充验收
+
+新增 `--data-dir /data/lan-note-sync`，使用两个带私有 SELinux 标签的 bind mount；部署配置默认也位于该目录下的 `deployment/`。本地共 44 项自动化测试，36 项通过、8 项按环境跳过。覆盖目录布局、路径空格、重复执行保留数据、拒绝从旧命名卷静默切换、受限初始化权限、正常重跑不重新标记正在使用的数据目录，以及拒绝从另一个配置目录接管现有 Compose 项目。
+
+真实 Linux 验证使用 WSL ext4 专用目录和两个已构建的生产镜像，Compose 使用 host-network 测试覆盖。确认 bind 类型、CouchDB 目录 UID5984/700、网关目录 UID1000/700，两个服务 healthy。通过 HTTP 配对、上传原始 BOM/CRLF 正文并提交修订；强制停止网关并重启 CouchDB 后，原设备凭证、serverId、修订与正文 SHA-256 均保留。`gateway-owner` 与 `default-vault` 实际写入指定数据目录，权限为 600。测试服务与隔离守护进程已停止，数据保留。
+
+实际 Rocky Linux 的 SELinux enforcing 和用户数据盘挂载尚需部署验收；未改变主机 Docker 全局 data-root。
+
+### 其他限制
+
 - 没有 Mac 实机；Bash 脚本核心路径在 Git Bash 验证，原生 osascript 选库与 macOS Obsidian 待验收。
 - Windows/macOS CI 已执行通过，记录见顶部补充。
 - 默认 Docker bridge、实际跨机 HTTPS、NAS 文件权限、持续运行、万人规模/大型历史库未验收。

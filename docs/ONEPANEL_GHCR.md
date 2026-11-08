@@ -47,6 +47,31 @@ docker compose exec -T sync node dist/server/cli.cjs invite --url http://192.168
 
 本机已经安装并运行 Docker 是前提。安装成功后两个容器应为 healthy。主机防火墙需要允许目标局域网设备访问 27123。
 
+## 将数据放到 /data 数据盘
+
+先确认 `/data` 已经挂载为你要使用的数据盘，再执行：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/dalei1563/obsidian-lan-sync/main/deployment/bootstrap-images.sh | bash -s -- --data-dir /data/lan-note-sync
+```
+
+不需要手动创建项目子目录。实际布局：
+
+```text
+/data/lan-note-sync/
+├── couchdb/       # 笔记正文、历史和设备记录
+├── gateway/       # 网关身份与默认笔记库等状态
+└── deployment/    # compose.yaml、.env、权限初始化标记
+```
+
+该方式对 CouchDB 和网关使用两个绑定挂载，数据不再位于本项目的 Docker 命名卷中。配置文件也在数据盘；管理命令需要先 `cd /data/lan-note-sync/deployment`。Docker 镜像、容器日志、缓存仍遵循主机 Docker 的全局目录，本脚本不修改 1Panel 其他服务的 Docker 存储设置。
+
+安装时仅为两个专用数据子目录初始化容器所需的属主和权限，服务仍以非 root 用户运行。Rocky Linux 的绑定挂载附带私有 SELinux `:Z` 标签，不要求关闭 SELinux。权限初始化只运行一次，重跑脚本不会通过临时容器重复更改正在使用的数据标签。
+
+如果已按旧方式启动过，不要把这条命令当成自动迁移：脚本会拒绝跨配置目录接管或把旧命名卷静默改为空目录。需要先停服备份，并成对迁移 CouchDB 和 gateway 数据，以及原 `.env`；保留网关所有权信息和原密码。不能只迁移 CouchDB。
+
+备份时停止这套服务，完整备份 `/data/lan-note-sync`，保留文件属主和权限。换目录或还原数据前先保留原目录。数据盘应设置开机自动挂载，并在重启后确认挂载正常，再启动应用。
+
 ## 可选：交给 1Panel 创建编排
 
 这只是面板管理偏好，不是 SSH 安装的必需步骤。需要面板创建编排时，给快捷安装命令追加 `--prepare-only`，它只生成配置，不启动容器。或者上传包根的 `compose.production.yaml` 和 `deployment/setup-images.sh`（保持相对目录），在 Rocky Linux 终端生成配置：
@@ -80,7 +105,7 @@ node dist/server/cli.cjs invite --url http://192.168.1.10:27123
 
 **如果 1Panel OpenResty 运行在容器中，代理目标 127.0.0.1 指向 OpenResty 自己。** 应把 sync 和 OpenResty 接入同一个用户定义 Docker 网络，给 sync 设置唯一网络别名（如 `lan-note-sync-gateway`），再代理到 `http://lan-note-sync-gateway:27123`。网络名称需根据服务器实际配置确认，不假定一定叫 `1panel-network`。CouchDB 继续只接入应用内部网络。
 
-本版使用 Docker 命名卷，避免依赖 Rocky Linux 宿主目录的 SELinux 标签。默认不要求关闭 SELinux。可信 LAN 直接访问需要明确开放监听，并由管理员在 1Panel/主机防火墙配置相应端口；正式公网使用 HTTPS 入口。
+未指定 `--data-dir` 时使用命名卷；指定后使用带 `:Z` 标签的绑定目录。默认不要求关闭 SELinux。可信 LAN 直接访问需要明确开放监听，并由管理员在 1Panel/主机防火墙配置相应端口；正式公网使用 HTTPS 入口。
 
 ## 后续更新
 
@@ -104,5 +129,7 @@ docker compose up -d --no-deps sync
 
 - 生产 Compose 已使用 Docker Compose 2.39.4 完成 config 校验，无源码 build。
 - 镜像配置生成测试通过：固定版本、自动随机密码、重复执行保留原配置、拒绝 latest。
-- 本次 npm test：30 项通过、7 项真实 CouchDB 测试未启动。新增测试验证无地址时直接执行拉取和启动，并将邀请生成延后；已有配置和密码保留。
+- 数据盘新增测试覆盖目录布局、空格路径、保留既有配置、拒绝隐式迁移和符号链接、受限权限初始化及正常重跑不重新标记数据目录。实际 SELinux enforcing 仍需在 Rocky Linux 主机验收。
+- 本次本地 npm test：36 项通过、8 项按环境跳过（7 项真实 CouchDB 单元集成与 1 项 Linux/macOS 链接检查）。测试验证无地址时直接拉取启动、数据盘绑定、已有配置和密码保留，以及拒绝隐式迁移。
+- 真实 WSL ext4 绑定挂载验证通过：受限权限初始化、两个服务 healthy、HTTP 配对/提交、强制重启网关及数据库后原始正文与修订保留。运行使用 host-network 覆盖；默认 bridge 和 Rocky SELinux enforcement 尚未实测。
 - GHCR 双架构构建发布、匿名 manifest 获取、Windows/macOS/Linux CI 已验证；未在用户实际 Rocky Linux / 1Panel 主机部署验收。
