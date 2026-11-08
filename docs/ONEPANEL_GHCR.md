@@ -2,22 +2,22 @@
 
 ## 发布状态
 
-2026-11-08：**两个 0.3.1 镜像已发布**，支持 linux/amd64 和 linux/arm64；0.3.1 修复通过 Tailscale 地址安装时的代理绕过问题。源码仓库为 [dalei1563/obsidian-lan-sync](https://github.com/dalei1563/obsidian-lan-sync)。[跨主机测试记录](TAILSCALE_TEST_REPORT.md)。
+2026-11-08：**两个 0.4.0 镜像已发布**，支持 linux/amd64 和 linux/arm64；新增单密码管理台、多仓库、设备管理和排除规则。源码仓库为 [dalei1563/obsidian-lan-sync](https://github.com/dalei1563/obsidian-lan-sync)。使用说明见[管理台指南](ADMIN_GUIDE.md)。
 
 ```text
-ghcr.io/dalei1563/obsidian-lan-sync:0.3.1
-ghcr.io/dalei1563/obsidian-lan-sync-couchdb:0.3.1
+ghcr.io/dalei1563/obsidian-lan-sync:0.4.0
+ghcr.io/dalei1563/obsidian-lan-sync-couchdb:0.4.0
 ```
 
-发布记录：[GHCR 构建](https://github.com/dalei1563/obsidian-lan-sync/actions/runs/42461228885)；[Windows、macOS 与真实 CouchDB CI](https://github.com/dalei1563/obsidian-lan-sync/actions/runs/42461315953) 均成功。macOS CI 通过不等同于 macOS Obsidian GUI 实机验收。
+发布记录：[0.4.0 GHCR 构建](https://github.com/dalei1563/obsidian-lan-sync/actions/runs/42486566431)；[Windows、macOS 与真实 CouchDB CI](https://github.com/dalei1563/obsidian-lan-sync/actions/runs/42486788775) 均成功。macOS CI 通过不等同于 macOS Obsidian GUI 实机验收。
 
 ## 镜像和更新约定
 
 主分支修改 package.json 版本号并提交，或发布匹配版本的 Git 标签，可触发 `.github/workflows/publish-images.yml`；也可在 Actions 手动运行。工作流先构建并运行真实 CouchDB 回归测试，然后发布：
 
 ```text
-ghcr.io/dalei1563/obsidian-lan-sync:0.3.1
-ghcr.io/dalei1563/obsidian-lan-sync-couchdb:0.3.1
+ghcr.io/dalei1563/obsidian-lan-sync:0.4.0
+ghcr.io/dalei1563/obsidian-lan-sync-couchdb:0.4.0
 ```
 
 工作流目标平台为 linux/amd64 和 linux/arm64；实际构建成功后才视为已支持。Tag、package.json 与插件 manifest.json 版本必须一致。使用 GitHub Actions 的 GITHUB_TOKEN，权限限定为发布作业的 packages:write；不在仓库或镜像中写入个人 Token。首次发布后检查两个 Package 的可见性，设为 Public 才能让服务器匿名拉取；公开源码仓库不等于镜像自动公开。
@@ -36,7 +36,7 @@ curl -fsSL https://raw.githubusercontent.com/dalei1563/obsidian-lan-sync/main/de
 
 脚本下载固定提交的部署模板并校验 SHA-256，自动在 `/opt/lan-note-sync` 生成配置和随机数据库密码，拉取镜像并启动两个容器。快捷安装默认开放宿主机 27123 端口用于局域网 HTTP；CouchDB 不发布端口。1Panel 可以查看容器，无需额外导入或重复创建编排。既有配置不覆盖：若以前已生成回环监听配置，改 `.env` 中 `SYNC_LISTEN_ADDRESS=0.0.0.0` 后运行 `docker compose up -d`。
 
-安装完成后，在客户端浏览器访问 `http://服务器IP:27123` 可检查服务页面。连接设备时，再使用该设备可达的地址生成邀请（替换示例 IP）：
+安装完成后，在客户端浏览器访问 `http://服务器IP:27123/admin/`，使用安装时输出的管理员密码。后台可以创建仓库并直接生成对应设备的安装命令。密码保存在原部署目录的 `.env` 中的 `SYNC_ADMIN_PASSWORD`，与数据库密码独立。也可继续通过 CLI 生成邀请（替换示例 IP）：
 
 ```bash
 cd /opt/lan-note-sync
@@ -79,7 +79,7 @@ curl -fsSL https://raw.githubusercontent.com/dalei1563/obsidian-lan-sync/main/de
 ```bash
 bash deployment/setup-images.sh \
   --image-prefix ghcr.io/dalei1563/obsidian-lan-sync \
-  --version 0.3.1 \
+  --version 0.4.0 \
   --expose-lan \
   --out /opt/lan-note-sync \
   --prepare-only
@@ -109,6 +109,16 @@ node dist/server/cli.cjs invite --url http://192.168.1.10:27123
 
 ## 后续更新
 
+从旧版升级到 0.4.0 时，在备份后使用原部署目录执行以下命令。这里假定使用 `/data/lan-note-sync/deployment`，请按原来的实际目录调整：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/dalei1563/obsidian-lan-sync/main/deployment/bootstrap-images.sh | bash -s -- --out /data/lan-note-sync/deployment --upgrade
+```
+
+升级会更新两项镜像引用、补齐旧 Compose 的后台环境映射，缺少管理员密码时自动生成；保留原数据库密码、数据挂载、项目名和监听地址。仅预检配置可在末尾再加 `--prepare-only`。此命令不迁移存储，不支持的自定义 YAML 会在修改配置前报错。服务端与各设备插件都更新到 0.4 后，再使用仓库排除规则。
+
+手动更新镜像的一般流程：
+
 1. 备份 CouchDB 卷、gateway 卷和 `.env`。
 2. 修改 `.env` 中 `SYNC_IMAGE` 为已发布的新版本。
 3. 在 1Panel 拉取新镜像并更新/重新创建 sync 容器，保持编排项目名、两个数据卷、密码和地址不变。普通重启容器不会替换镜像。
@@ -130,6 +140,6 @@ docker compose up -d --no-deps sync
 - 生产 Compose 已使用 Docker Compose 2.39.4 完成 config 校验，无源码 build。
 - 镜像配置生成测试通过：固定版本、自动随机密码、重复执行保留原配置、拒绝 latest。
 - 数据盘新增测试覆盖目录布局、空格路径、保留既有配置、拒绝隐式迁移和符号链接、受限权限初始化及正常重跑不重新标记数据目录。实际 SELinux enforcing 仍需在 Rocky Linux 主机验收。
-- 本次本地 npm test：36 项通过、8 项按环境跳过（7 项真实 CouchDB 单元集成与 1 项 Linux/macOS 链接检查）。测试验证无地址时直接拉取启动、数据盘绑定、已有配置和密码保留，以及拒绝隐式迁移。
+- 0.4 本地 npm test：74 项，64 通过、10 按环境跳过，无失败；真实 CouchDB CI：70 通过、4 按平台跳过。包含旧部署升级、管理员登录、多仓库和排除规则回归。
 - 真实 WSL ext4 绑定挂载验证通过：受限权限初始化、两个服务 healthy、HTTP 配对/提交、强制重启网关及数据库后原始正文与修订保留。运行使用 host-network 覆盖；默认 bridge 和 Rocky SELinux enforcement 尚未实测。
 - GHCR 双架构构建发布、匿名 manifest 获取、Windows/macOS/Linux CI 已验证；未在用户实际 Rocky Linux / 1Panel 主机部署验收。

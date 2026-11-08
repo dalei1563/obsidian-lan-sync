@@ -16,7 +16,7 @@ foreach ($name in @('src','server','shared','admin','deployment','scripts','test
   Copy-Item -LiteralPath (Join-Path $project $name) -Destination (Join-Path $server $name) -Recurse
 }
 New-Item -ItemType Directory -Path (Join-Path $server 'docs') | Out-Null
-foreach ($name in @('SERVER_QUICKSTART.md','COUCHDB_DESIGN.md','COUCHDB_TEST_REPORT.md','ONEPANEL_GHCR.md','TAILSCALE_TEST_REPORT.md','ADMIN_GUIDE.md','LAN_SYNC_DESIGN.md','LAN_SYNC_TEST_REPORT.md','screenshots')) {
+foreach ($name in @('SERVER_QUICKSTART.md','COUCHDB_DESIGN.md','COUCHDB_TEST_REPORT.md','ONEPANEL_GHCR.md','TAILSCALE_TEST_REPORT.md','ADMIN_GUIDE.md','ADMIN_TEST_REPORT.md','LAN_SYNC_DESIGN.md','LAN_SYNC_TEST_REPORT.md','screenshots')) {
   Copy-Item -LiteralPath (Join-Path $project ('docs/' + $name)) -Destination (Join-Path $server ('docs/' + $name)) -Recurse
 }
 foreach ($name in @('README.md','package.json','package-lock.json','tsconfig.json','esbuild.config.mjs','manifest.json','styles.css','Dockerfile','compose.yaml','compose.production.yaml','.dockerignore','.gitignore')) {
