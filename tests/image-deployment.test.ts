@@ -1,6 +1,6 @@
 import test, { TestContext } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync, chmodSync, symlinkSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync, chmodSync, symlinkSync } from 'node:fs';
 import { join, resolve, sep } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { id } from '../shared/protocol';
@@ -138,4 +138,93 @@ test('data-disk deployment refuses to replace an existing project owned by anoth
   assert.notEqual(result.status, 0); assert.match(result.stderr, /another deployment directory/);
   assert.doesNotMatch(readFileSync(log, 'utf8'), /compose (up|pull)|^run /m);
   assert.equal(existsSync(join(data, 'deployment', '.env')), false);
+});
+
+function legacyCompose(compose: string): string {
+  return compose.replace(/^.*SYNC_ADMIN_(?:PASSWORD|SECURE_COOKIE):.*\r?\n/gm, '');
+}
+
+test('re-running an old deployment enables admin environment mappings and preserves existing images and custom Compose settings', { skip: !existsSync(bash) }, t => {
+  const root = bindRuntime(t), args = ['--out', posix(root)];
+  assert.equal(prepare(args).status, 0);
+  const envPath = join(root, '.env'), composePath = join(root, 'compose.yaml');
+  const oldEnv = readFileSync(envPath, 'utf8').replace(/^SYNC_IMAGE=.*$/m, 'SYNC_IMAGE=ghcr.io/original/sync:0.3.1').replace(/^COUCHDB_IMAGE=.*$/m, 'COUCHDB_IMAGE=ghcr.io/original/sync-couchdb:0.3.1').replace(/^SYNC_ADMIN_PASSWORD=.*\n/m, '');
+  const oldCompose = legacyCompose(readFileSync(composePath, 'utf8')).replace('name: lan-note-sync-couch', 'name: custom-notes').replace(':27123:27123', ':29999:27123').replace('gateway-data}:/data', 'custom-gateway-volume}:/data');
+  writeFileSync(envPath, oldEnv); writeFileSync(composePath, oldCompose);
+  const result = prepare([...args, '--version', '0.4.0', '--public-url', 'http://192.0.2.1:27123']);
+  assert.equal(result.status, 0, result.stderr);
+  const updatedEnv = readFileSync(envPath, 'utf8'), updatedCompose = readFileSync(composePath, 'utf8');
+  assert.equal(updatedEnv.replace(/^SYNC_ADMIN_PASSWORD=.*\n/m, ''), oldEnv);
+  assert.match(setting(updatedEnv, 'SYNC_ADMIN_PASSWORD'), /^[a-f0-9]{32}$/);
+  assert.equal(legacyCompose(updatedCompose), oldCompose);
+  assert.equal(updatedCompose.match(/^      SYNC_ADMIN_PASSWORD:/gm)?.length, 1);
+  assert.equal(updatedCompose.match(/^      SYNC_ADMIN_SECURE_COOKIE:/gm)?.length, 1);
+  assert.match(result.stdout, /Use --upgrade/);
+  const again = prepare(args); assert.equal(again.status, 0, again.stderr);
+  assert.equal(readFileSync(envPath, 'utf8'), updatedEnv); assert.equal(readFileSync(composePath, 'utf8'), updatedCompose);
+  assert.doesNotMatch(again.stdout, /Administrator password/);
+});
+
+test('explicit upgrade changes only image coordinates and missing admin mappings while preserving data-disk credentials and configuration', { skip: !existsSync(bash) }, t => {
+  const root = bindRuntime(t), data = join(root, 'data'), output = join(root, 'deployment');
+  const first = prepare(['--data-dir', posix(data), '--out', posix(output), '--public-url', 'http://192.0.2.10:29999', '--expose-lan']);
+  assert.equal(first.status, 0, first.stderr);
+  const envPath = join(output, '.env'), composePath = join(output, 'compose.yaml');
+  const oldEnv = readFileSync(envPath, 'utf8').replace(/^SYNC_IMAGE=.*$/m, 'SYNC_IMAGE=ghcr.io/original/sync:0.3.1').replace(/^COUCHDB_IMAGE=.*$/m, 'COUCHDB_IMAGE=ghcr.io/original/sync-couchdb:0.3.1') + '# operator setting\nCOMPOSE_PROJECT_NAME=custom-notes\nSYNC_ADMIN_SECURE_COOKIE=true\n';
+  const oldCompose = legacyCompose(readFileSync(composePath, 'utf8')).replace('name: lan-note-sync-couch', 'name: custom-notes').replace(':27123:27123', ':29999:27123');
+  writeFileSync(envPath, oldEnv); writeFileSync(composePath, oldCompose);
+  const args = ['--out', posix(output), '--upgrade', '--image-prefix', 'ghcr.io/new-owner/new-sync', '--version', '0.4.0', '--public-url', 'http://192.0.2.99:27123'];
+  const result = prepare(args); assert.equal(result.status, 0, result.stderr);
+  const updatedEnv = readFileSync(envPath, 'utf8'), updatedCompose = readFileSync(composePath, 'utf8');
+  assert.equal(updatedEnv, oldEnv.replace(/^SYNC_IMAGE=.*$/m, 'SYNC_IMAGE=ghcr.io/new-owner/new-sync:0.4.0').replace(/^COUCHDB_IMAGE=.*$/m, 'COUCHDB_IMAGE=ghcr.io/new-owner/new-sync-couchdb:0.4.0'));
+  assert.equal(legacyCompose(updatedCompose), oldCompose);
+  assert.doesNotMatch(result.stdout, /Administrator password/);
+  assert.equal(existsSync(join(data, 'couchdb')), true); assert.equal(existsSync(join(data, 'gateway')), true);
+  const again = prepare(args); assert.equal(again.status, 0, again.stderr);
+  assert.equal(readFileSync(envPath, 'utf8'), updatedEnv); assert.equal(readFileSync(composePath, 'utf8'), updatedCompose);
+});
+
+test('upgrade requires the original deployment and never replaces an incomplete deployment configuration', { skip: !existsSync(bash) }, t => {
+  const root = bindRuntime(t), envPath = join(root, '.env');
+  const result = prepare(['--out', posix(root), '--upgrade']); assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /requires an existing deployment/); assert.equal(existsSync(envPath), false);
+  writeFileSync(envPath, 'SYNC_IMAGE=original\nCOUCHDB_PASSWORD=fixture-only\n');
+  const again = prepare(['--out', posix(root), '--upgrade']); assert.notEqual(again.status, 0);
+  assert.equal(readFileSync(envPath, 'utf8'), 'SYNC_IMAGE=original\nCOUCHDB_PASSWORD=fixture-only\n');
+  assert.equal(existsSync(join(root, 'compose.yaml')), false);
+});
+
+test('unrecognized Compose environment shapes fail before changing either deployment file', { skip: !existsSync(bash) }, t => {
+  const root = bindRuntime(t), shapes = [
+    '    environment: { SYNC_BACKEND: couchdb }\n',
+    '    environment:\n      - SYNC_BACKEND=couchdb\n',
+    '    environment: *shared-env\n',
+    '    environment:\n      <<: *shared-env\n      SYNC_BACKEND: couchdb\n',
+    '    environment:\n      SYNC_BACKEND: couchdb\n    environment:\n      OTHER: value\n',
+  ];
+  for (const [index, shape] of shapes.entries()) {
+    const output = join(root, String(index)); assert.equal(prepare(['--out', posix(output)]).status, 0);
+    const envPath = join(output, '.env'), composePath = join(output, 'compose.yaml');
+    const oldEnv = readFileSync(envPath, 'utf8').replace(/^SYNC_ADMIN_PASSWORD=.*\n/m, '');
+    const oldCompose = legacyCompose(readFileSync(composePath, 'utf8')).replace(/    environment:\n(?:      .*\n)+(?=    ports:)/, shape);
+    writeFileSync(envPath, oldEnv); writeFileSync(composePath, oldCompose);
+    for (const upgrade of [[], ['--upgrade']]) {
+      const result = prepare(['--out', posix(output), ...upgrade]); assert.notEqual(result.status, 0, String(index));
+      assert.match(result.stderr, /Unrecognized Compose/);
+      assert.equal(readFileSync(envPath, 'utf8'), oldEnv); assert.equal(readFileSync(composePath, 'utf8'), oldCompose);
+      assert.equal(readdirSync(output).some(name => name.startsWith('.compose.upgrade-') || name.startsWith('.env.upgrade-')), false);
+    }
+  }
+});
+
+test('existing admin mappings and CRLF Compose content survive adding only the missing setting', { skip: !existsSync(bash) }, t => {
+  const root = bindRuntime(t); assert.equal(prepare(['--out', posix(root)]).status, 0);
+  const composePath = join(root, 'compose.yaml'), envPath = join(root, '.env'), oldEnv = readFileSync(envPath, 'utf8');
+  const oldCompose = readFileSync(composePath, 'utf8').replace(/^.*SYNC_ADMIN_SECURE_COOKIE:.*\n/m, '').replace('SYNC_ADMIN_PASSWORD: ${SYNC_ADMIN_PASSWORD:-}', 'SYNC_ADMIN_PASSWORD: ${CUSTOM_ADMIN_PASSWORD:-}').replace(/\r?\n/g, '\r\n');
+  writeFileSync(composePath, oldCompose);
+  const result = prepare(['--out', posix(root)]); assert.equal(result.status, 0, result.stderr);
+  const updated = readFileSync(composePath, 'utf8');
+  assert.equal(updated.replace(/^.*SYNC_ADMIN_SECURE_COOKIE:.*\r\n/m, ''), oldCompose);
+  assert.match(updated, /SYNC_ADMIN_PASSWORD: \$\{CUSTOM_ADMIN_PASSWORD:-\}/);
+  assert.equal(updated.match(/^      SYNC_ADMIN_SECURE_COOKIE:/gm)?.length, 1); assert.equal(readFileSync(envPath, 'utf8'), oldEnv);
 });

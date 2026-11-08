@@ -4,6 +4,8 @@ import { mkdirSync, writeFileSync, readFileSync, existsSync, openSync, closeSync
 import { resolve, join } from 'node:path';
 import { assertHash, assertId, Changes, CommitResult, Cursor, FileState, hash, id, MAX_BYTES, MAX_FILES, PairResult, pathsOverlap, PROTOCOL, Revision, Snapshot, SyncError, validateRevision } from '../shared/protocol';
 import type { Backend, DeviceInfo } from './backend';
+import { ActivityPage, VaultSummary, activityId, activityLimit, managementName, parseActivityCursor, revisionAction, summarizeFiles } from '../shared/management';
+import { normalizeExclusions, isExcluded } from '../shared/exclusions';
 
 type Row = Record<string, any>;
 export class Store implements Backend {
@@ -28,6 +30,13 @@ export class Store implements Backend {
       CREATE TABLE IF NOT EXISTS changes(seq INTEGER PRIMARY KEY AUTOINCREMENT, vault_id TEXT NOT NULL, file_id TEXT NOT NULL, revision_id TEXT NOT NULL, payload TEXT NOT NULL);
       CREATE INDEX IF NOT EXISTS change_vault ON changes(vault_id,seq);
       CREATE TABLE IF NOT EXISTS operations(vault_id TEXT NOT NULL, revision_id TEXT NOT NULL, result TEXT NOT NULL, PRIMARY KEY(vault_id,revision_id));`);
+    // Additive migrations leave old timestamps unknown instead of inventing a
+    // date from sequence IDs or the time this version first opens the database.
+    const vaultColumns = new Set((this.db.prepare('PRAGMA table_info(vaults)').all() as Row[]).map(r => r.name));
+    if (!vaultColumns.has('created_at')) this.db.exec('ALTER TABLE vaults ADD COLUMN created_at INTEGER');
+    if (!vaultColumns.has('excluded_paths')) this.db.exec("ALTER TABLE vaults ADD COLUMN excluded_paths TEXT NOT NULL DEFAULT '[]'");
+    const revisionColumns = new Set((this.db.prepare('PRAGMA table_info(revisions)').all() as Row[]).map(r => r.name));
+    if (!revisionColumns.has('created_at')) this.db.exec('ALTER TABLE revisions ADD COLUMN created_at INTEGER');
     const version = this.db.prepare("SELECT value FROM meta WHERE key='schema'").get() as Row | undefined;
     if (version && version.value !== '1') throw new Error('Unsupported database schema');
     this.db.prepare("INSERT OR IGNORE INTO meta VALUES ('schema','1')").run();
@@ -48,7 +57,7 @@ export class Store implements Backend {
     const code = randomBytes(12).toString('hex');
     const expires = Date.now() + 10 * 60 * 1000;
     this.transaction(() => {
-      this.db.prepare('INSERT OR IGNORE INTO vaults VALUES (?,?)').run(vid, vaultName);
+      this.db.prepare('INSERT OR IGNORE INTO vaults(id,name,created_at) VALUES (?,?,?)').run(vid, vaultName, Date.now());
       this.db.prepare('DELETE FROM pairing WHERE expires < ?').run(Date.now());
       this.db.prepare('INSERT INTO pairing VALUES (?,?,?)').run(hash(code), vid, expires);
     });
@@ -98,6 +107,55 @@ export class Store implements Backend {
     const rows = this.db.prepare('SELECT r.payload FROM heads h JOIN revisions r ON r.vault_id=h.vault_id AND r.id=h.revision_id WHERE h.vault_id=? AND h.file_id=? ORDER BY r.id').all(vaultId, fileId) as Row[];
     return { fileId, heads: rows.map(r => JSON.parse(r.payload)) };
   }
+  private vault(vaultId: string): Row {
+    assertId(vaultId);
+    const vault = this.db.prepare('SELECT * FROM vaults WHERE id=?').get(vaultId) as Row | undefined;
+    if (!vault) throw new SyncError('vault_missing', '仓库不存在', 404);
+    return vault;
+  }
+  private exclusions(vaultId: string): string[] { return normalizeExclusions(JSON.parse(this.vault(vaultId).excluded_paths)); }
+  createVault(name: string): { id: string; name: string } {
+    const result = { id: id(), name: managementName(name) };
+    this.db.prepare('INSERT INTO vaults(id,name,created_at) VALUES (?,?,?)').run(result.id, result.name, Date.now());
+    return result;
+  }
+  renameVault(vaultId: string, name: string): void {
+    this.vault(vaultId); this.db.prepare('UPDATE vaults SET name=? WHERE id=?').run(managementName(name), vaultId);
+  }
+  setExclusions(vaultId: string, input: unknown): string[] {
+    this.vault(vaultId); const rules = normalizeExclusions(input);
+    this.db.prepare('UPDATE vaults SET excluded_paths=? WHERE id=?').run(JSON.stringify(rules), vaultId); return rules;
+  }
+  listVaults(): VaultSummary[] {
+    return (this.db.prepare('SELECT * FROM vaults ORDER BY COALESCE(created_at,0) DESC,id').all() as Row[]).map(vault => {
+      const files = (this.db.prepare('SELECT DISTINCT file_id FROM heads WHERE vault_id=?').all(vault.id) as Row[]).map(r => this.file(vault.id, r.file_id));
+      return { id: vault.id, name: vault.name, createdAt: vault.created_at ?? null, ...summarizeFiles(files),
+        revisionCount: Number((this.db.prepare('SELECT COUNT(*) n FROM revisions WHERE vault_id=?').get(vault.id) as Row).n),
+        devices: Number((this.db.prepare('SELECT COUNT(*) n FROM devices WHERE vault_id=? AND revoked=0').get(vault.id) as Row).n),
+        excludedPaths: normalizeExclusions(JSON.parse(vault.excluded_paths)) };
+    });
+  }
+  activity(vaultId?: string, before?: string, limit = 50): ActivityPage {
+    activityLimit(limit); if (vaultId !== undefined) this.vault(vaultId);
+    let beforeSeq = Number.MAX_SAFE_INTEGER;
+    if (before !== undefined) {
+      const [vid, rid] = parseActivityCursor(before);
+      if (vaultId !== undefined && vid !== vaultId) throw new SyncError('invalid_cursor', '变更记录游标不属于当前仓库', 400);
+      const found = this.db.prepare('SELECT seq FROM changes WHERE vault_id=? AND revision_id=?').get(vid, rid) as Row | undefined;
+      if (!found) throw new SyncError('invalid_cursor', '变更记录游标已失效，请重新加载', 400);
+      beforeSeq = Number(found.seq);
+    }
+    const rows = this.db.prepare(`SELECT c.seq,c.vault_id,r.payload,r.created_at,v.name vault_name,d.name device_name FROM changes c JOIN revisions r ON r.vault_id=c.vault_id AND r.id=c.revision_id JOIN vaults v ON v.id=c.vault_id LEFT JOIN devices d ON d.id=json_extract(r.payload,'$.clientId') WHERE c.seq<? ${vaultId === undefined ? '' : 'AND c.vault_id=?'} ORDER BY c.seq DESC LIMIT ?`)
+      .all(...(vaultId === undefined ? [beforeSeq, limit + 1] : [beforeSeq, vaultId, limit + 1])) as Row[];
+    const parentQuery = this.db.prepare('SELECT payload FROM revisions WHERE vault_id=? AND id=?');
+    const items = rows.slice(0, limit).map(row => {
+      const r = JSON.parse(row.payload) as Revision;
+      return { id: activityId(row.vault_id, r.id), vaultId: row.vault_id, vaultName: row.vault_name, fileId: r.fileId, path: r.path,
+        action: revisionAction(r, parent => { const p = parentQuery.get(row.vault_id, parent) as Row | undefined; return p && JSON.parse(p.payload); }),
+        deviceId: r.clientId, deviceName: row.device_name ?? '未知设备', bytes: r.size, createdAt: row.created_at ?? null };
+    });
+    return { items, nextCursor: rows.length > limit ? items[items.length - 1].id : null };
+  }
   snapshot(vaultId: string): Snapshot {
     // Synchronous code inside a SQLite read transaction: consistent files and cursor.
     this.db.exec('BEGIN');
@@ -105,7 +163,7 @@ export class Store implements Backend {
       const rows = this.db.prepare('SELECT DISTINCT file_id FROM heads WHERE vault_id=? ORDER BY file_id LIMIT ?').all(vaultId, MAX_FILES + 1) as Row[];
       if (rows.length > MAX_FILES) throw new SyncError('vault_too_large', '首版最多支持 10000 个逻辑文件', 413);
       const cursor = Number((this.db.prepare('SELECT COALESCE(MAX(seq),0) n FROM changes WHERE vault_id=?').get(vaultId) as Row).n);
-      const result = { protocol: PROTOCOL, serverId: this.serverId, epoch: this.epoch, cursor, files: rows.map(r => this.file(vaultId, r.file_id)) };
+      const result = { protocol: PROTOCOL, serverId: this.serverId, epoch: this.epoch, cursor, files: rows.map(r => this.file(vaultId, r.file_id)), excludedPaths: this.exclusions(vaultId) };
       this.db.exec('COMMIT'); return result;
     } catch (e) { this.db.exec('ROLLBACK'); throw e; }
   }
@@ -117,7 +175,7 @@ export class Store implements Backend {
     const rows = this.db.prepare('SELECT seq,payload FROM changes WHERE vault_id=? AND seq>? ORDER BY seq LIMIT ?').all(vaultId, after, limit + 1) as Row[];
     const page = rows.slice(0, limit);
     return { serverId: this.serverId, epoch: this.epoch, cursor: page.length ? Number(page[page.length - 1].seq) : after,
-      more: rows.length > limit, changes: page.map(r => ({ seq: Number(r.seq), file: JSON.parse(r.payload) })) };
+      more: rows.length > limit, changes: page.map(r => ({ seq: Number(r.seq), file: JSON.parse(r.payload) })), excludedPaths: this.exclusions(vaultId) };
   }
   commit(vaultId: string, input: unknown, deviceId: string): CommitResult {
     const revision = validateRevision(input);
@@ -128,6 +186,7 @@ export class Store implements Backend {
         if (previous.payload !== JSON.stringify(revision)) throw new SyncError('idempotency_conflict', '修订标识被用于不同内容');
         return JSON.parse((this.db.prepare('SELECT result FROM operations WHERE vault_id=? AND revision_id=?').get(vaultId, revision.id) as Row).result);
       }
+      if (isExcluded(revision.path, this.exclusions(vaultId))) throw new SyncError('path_excluded', '该路径已被仓库排除规则暂停同步', 409);
       const existing = this.file(vaultId, revision.fileId);
       if (existing.heads.length && !revision.parents.length) throw new SyncError('missing_parent', '已有文件不能创建第二个无父版本');
       if (!existing.heads.length) {
@@ -144,7 +203,7 @@ export class Store implements Backend {
         const paths = this.db.prepare('SELECT r.payload FROM heads h JOIN revisions r ON r.vault_id=h.vault_id AND r.id=h.revision_id WHERE h.vault_id=? AND h.file_id<>?').all(vaultId, revision.fileId) as Row[];
         if (paths.some(p => { const r: Revision = JSON.parse(p.payload); return !r.deleted && pathsOverlap(r.path, revision.path); })) throw new SyncError('path_conflict', '目标路径已被其他逻辑文件占用');
       }
-      this.db.prepare('INSERT INTO revisions VALUES (?,?,?,?)').run(vaultId, revision.id, revision.fileId, JSON.stringify(revision));
+      this.db.prepare('INSERT INTO revisions(vault_id,id,file_id,payload,created_at) VALUES (?,?,?,?,?)').run(vaultId, revision.id, revision.fileId, JSON.stringify(revision), Date.now());
       // Existing heads form an antichain: no current head can be an ancestor of an
       // existing non-head parent. Direct-parent removal is sufficient and avoids
       // walking the full history on every keystroke batch.

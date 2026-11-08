@@ -21,6 +21,17 @@ if [ ! -e .env ]; then
   password=$(od -An -N32 -tx1 /dev/urandom | tr -d ' \n')
   printf 'COUCHDB_USER=lan_sync_admin\nCOUCHDB_PASSWORD=%s\nSYNC_PUBLIC_URL=%s\nSYNC_LISTEN_ADDRESS=%s\n' "$password" "${public_url%/}" "$listen" > .env
 else printf '%s\n' 'Existing deployment configuration preserved.'; fi
+admin_password=''
+if ! grep -q '^SYNC_ADMIN_PASSWORD=.' .env; then
+  umask 077
+  admin_password=$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')
+  admin_env=$(mktemp .env.admin-XXXXXXXX)
+  sed '/^SYNC_ADMIN_PASSWORD=/d' .env > "$admin_env"
+  printf 'SYNC_ADMIN_PASSWORD=%s\n' "$admin_password" >> "$admin_env"
+  mv "$admin_env" .env
+fi
 docker compose up -d --build --wait --wait-timeout 180
 printf '%s\n' 'Services are ready. Keep the Vault ID below for additional devices.'
+printf 'Management page: %s/admin/\n' "${public_url%/}"
+if [ -n "$admin_password" ]; then printf 'Administrator password (save it): %s\n' "$admin_password"; fi
 docker compose exec -T sync node dist/server/cli.cjs invite --name "$name"

@@ -3,6 +3,7 @@ import { createServer as createHttpsServer, ServerOptions } from 'node:https';
 import type { Backend } from './backend';
 import { MAX_BYTES, PROTOCOL, SyncError, assertId } from '../shared/protocol';
 import type { Distribution } from './distribution';
+import { AdminController, AdminOptions } from './admin';
 
 async function body(req: IncomingMessage, max: number): Promise<Buffer> {
   const chunks: Buffer[] = []; let size = 0;
@@ -21,7 +22,8 @@ async function readJson(req: IncomingMessage): Promise<any> {
   try { return JSON.parse((await body(req, 32 * 1024)).toString('utf8')); }
   catch (e) { if (e instanceof SyncError) throw e; throw new SyncError('invalid_json', 'JSON 无效', 400); }
 }
-export function makeServer(store: Backend, tls?: ServerOptions, distribution?: Distribution) {
+export function makeServer(store: Backend, tls?: ServerOptions, distribution?: Distribution, adminOptions?: AdminOptions) {
+  const admin = new AdminController(store, adminOptions);
   const limits = new Map<string, { count: number; until: number }>();
   const handler = async (req: IncomingMessage, res: ServerResponse) => {
     try {
@@ -37,10 +39,10 @@ export function makeServer(store: Backend, tls?: ServerOptions, distribution?: D
         res.setHeader('Retry-After', '60'); throw new SyncError('rate_limited', '请求过于频繁，请稍后重试', 429);
       }
       if (req.method === 'GET' && url.pathname === '/v1/health') { await store.health(); return json(res, 200, { ok: true, protocol: PROTOCOL, backend: store.kind }); }
+      if (await admin.handle(req, res, url, ip)) return;
       if (req.method === 'GET' && distribution?.serve(url.pathname, res)) return;
       if (req.method === 'GET' && url.pathname === '/') {
-        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Content-Security-Policy': "default-src 'none'; style-src 'unsafe-inline'", 'Cache-Control': 'no-store' });
-        res.end('<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>LAN Note Sync</title><style>body{font:18px system-ui;max-width:660px;margin:12vh auto;padding:24px;line-height:1.8}code{background:#eee;padding:4px 8px}</style><h1>LAN Note Sync</h1><p>这是你自己的笔记同步服务。</p><p>向管理员获取一条 Windows 或 macOS 安装命令，指定本地 Vault 后运行；在 Obsidian 中启用插件，再确认首次同步即可。</p><p>已安装插件：打开设置，粘贴完整连接码。</p><p>管理员：运行 <code>invite</code> 为每台设备生成独立的连接码和安装命令。客户端不需要 CouchDB 账号。</p></html>'); return;
+        res.writeHead(303, { Location: '/admin/', 'Cache-Control': 'no-store' }); res.end(); return;
       }
       if (req.method === 'POST' && url.pathname === '/v1/pair') {
         const data = await readJson(req);
@@ -48,6 +50,7 @@ export function makeServer(store: Backend, tls?: ServerOptions, distribution?: D
         return json(res, 201, await store.pair(data.code.replace(/\s|-/g, ''), data.deviceName, data.requestId));
       }
       const auth = await store.authenticate((req.headers.authorization ?? '').replace(/^Bearer /, ''));
+      admin.observeDevice(auth.deviceId);
       const match = /^\/v1\/vaults\/([a-zA-Z0-9_-]+)\/(state|changes|commits|objects|history|check)(?:\/([a-zA-Z0-9_-]+))?$/.exec(url.pathname);
       if (!match) throw new SyncError('not_found', '接口不存在', 404);
       const [, vaultId, action, target] = match; assertId(vaultId);

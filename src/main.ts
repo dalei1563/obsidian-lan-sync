@@ -9,9 +9,10 @@ import { ObsidianVault } from './sync/obsidian-vault';
 import { normalizeServer, Remote, Transport } from './sync/remote';
 import { decodeConnection } from '../shared/connection';
 import { Enrollment } from './sync/enrollment';
+import { normalizeExclusions } from '../shared/exclusions';
 
 export default class LanSyncPlugin extends Plugin {
-  settings: LanSettings = { ...DEFAULT_SETTINGS };
+  settings: LanSettings = { ...DEFAULT_SETTINGS, excludedPaths: [] };
   engine?: Engine;
   disk?: DiskState;
   local?: ObsidianVault;
@@ -31,6 +32,7 @@ export default class LanSyncPlugin extends Plugin {
   async onload(): Promise<void> {
     const raw = (await this.loadData()) ?? {};
     for (const key of Object.keys(DEFAULT_SETTINGS) as (keyof LanSettings)[]) {
+      if (key === 'excludedPaths') { this.settings.excludedPaths = normalizeExclusions(raw.excludedPaths ?? []); continue; }
       if (typeof raw[key] === typeof DEFAULT_SETTINGS[key]) (this.settings as any)[key] = raw[key];
     }
     if (!this.settings.secretId) this.settings.secretId = 'lan-sync-' + id();
@@ -130,7 +132,7 @@ export default class LanSyncPlugin extends Plugin {
       const state = this.disk.load() ?? newState(this.settings.serverId, this.settings.vaultId, this.settings.deviceId);
       if (state.serverId !== this.settings.serverId || state.vaultId !== this.settings.vaultId || state.clientId !== this.settings.deviceId) throw new Error('绑定与本地基线不匹配，已停止同步');
       this.local = new ObsidianVault(this.app, this.disk);
-      this.engine = new Engine(new Remote(url, this.settings.vaultId, token, this.transport), this.local, state, s => this.disk!.save(s), m => this.setStatus(m));
+      this.engine = new Engine(new Remote(url, this.settings.vaultId, token, this.transport), this.local, state, s => this.disk!.save(s), m => this.setStatus(m), { excludedPaths: () => this.settings.excludedPaths, configDir: this.app.vault.configDir });
       this.setStatus(!state.initialized ? '已配对，等待首次同步预览' : this.settings.enabled ? '等待同步' : '自动同步已暂停');
     } catch (e) { this.disk.close(); this.disk = undefined; throw e; }
   }
@@ -191,7 +193,10 @@ export default class LanSyncPlugin extends Plugin {
       }));
     }
     const issues = Object.entries(state.issues).filter(([fileId]) => fileId !== '__deletes__');
-    if (!issues.length && !plan) modal.contentEl.createEl('p', { text: state.pending.length ? `还有 ${state.pending.length} 项待上传。` : '当前没有冲突或待处理项。' });
+    if (!issues.length && !plan) {
+      const held = state.pending.filter(p => engine.isExcluded(p.revision.path) || engine.isExcluded(state.entries[p.revision.fileId]?.path ?? p.revision.path)).length;
+      modal.contentEl.createEl('p', { text: state.pending.length ? `待上传 ${state.pending.length - held} 项；${held} 项因排除规则暂停，原快照保留在本地。` : '当前没有冲突或待处理项。' });
+    }
     for (const [fileId, message] of issues) {
       const entry = state.entries[fileId], file = state.remote[fileId];
       const card = modal.contentEl.createDiv('lan-sync-card');

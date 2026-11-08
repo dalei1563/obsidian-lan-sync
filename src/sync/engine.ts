@@ -1,9 +1,10 @@
 import { Cursor, FileState, hash, id, MAX_BYTES, pathKey, Revision, Snapshot, SyncError, validatePath } from '../../shared/protocol';
 import { Remote } from './remote';
+import { isExcluded, normalizeExclusions } from '../../shared/exclusions';
 
 export interface ApplyRequest { oldPath: string; path: string; expectedHash: string | null; content: Buffer | null }
 export interface LocalVault {
-  scan(): Promise<Map<string, Buffer>>;
+  scan(accept?: (path: string) => boolean): Promise<Map<string, Buffer>>;
   read(path: string): Promise<Buffer | null>;
   apply(request: ApplyRequest): Promise<void>;
   preserve(data: Buffer): Promise<void>;
@@ -34,18 +35,31 @@ export interface SyncState {
   deletePlan?: { fingerprint: string; paths: string[]; direction: 'local' | 'remote' };
   deleteApproval?: string;
   applying?: { fileId: string; revision: Revision };
+  serverExcludedPaths?: string[];
 }
 export function newState(serverId: string, vaultId: string, clientId: string): SyncState {
   return { schema: 1, serverId, vaultId, clientId, initialized: false, epoch: '', cursor: 0, remote: {}, entries: {}, pending: [], issues: {} };
 }
 export interface Preview { upload: number; download: number; same: number; conflicts: number; local: number; remote: number }
+export interface EngineOptions { excludedPaths?: () => readonly string[]; configDir?: string }
 export class Engine {
   private tail: Promise<unknown> = Promise.resolve();
   private running?: Promise<void>;
   private stopped = false;
   constructor(readonly remote: Remote, readonly local: LocalVault, readonly state: SyncState,
-    readonly save: (state: SyncState) => Promise<void>, readonly report: (message: string) => void = () => {}) {
+    readonly save: (state: SyncState) => Promise<void>, readonly report: (message: string) => void = () => {}, readonly options: EngineOptions = {}) {
     if (state.schema !== 1 || state.vaultId !== remote.vaultId) throw new Error('本地同步状态不匹配，已停止');
+    if (state.serverExcludedPaths !== undefined) state.serverExcludedPaths = normalizeExclusions(state.serverExcludedPaths);
+  }
+  isExcluded(path: string): boolean { return isExcluded(path, [...(this.state.serverExcludedPaths ?? []), ...normalizeExclusions([...(this.options.excludedPaths?.() ?? [])])], this.options.configDir); }
+  private policy(rules?: string[]): void {
+    // Older gateways omit this field. Keep the last durable policy on downgrade;
+    // an explicit empty array is the only way to remove an existing policy.
+    if (rules !== undefined || this.state.serverExcludedPaths === undefined) this.state.serverExcludedPaths = normalizeExclusions(rules ?? []);
+  }
+  private async scan(): Promise<Map<string, Buffer>> {
+    const files = await this.local.scan(path => !this.isExcluded(path));
+    return new Map([...files].filter(([path]) => !this.isExcluded(path)));
   }
   private exclusive<T>(action: () => Promise<T>): Promise<T> {
     const result = this.tail.then(action);
@@ -55,6 +69,7 @@ export class Engine {
   private checkIdentity(s: { serverId: string }) { if (s.serverId !== this.state.serverId) throw new Error('服务端身份已变化，请检查地址或备份恢复情况'); }
   private async snapshot(): Promise<void> {
     const s = await this.remote.snapshot(); this.checkIdentity(s);
+    this.policy(s.excludedPaths);
     const bases = Object.values(this.state.entries).filter(e => !!e.baseRevision);
     const known = await this.remote.known([...new Set(bases.map(e => e.baseRevision!))]);
     for (const entry of bases) if (!known.has(entry.baseRevision!)) {
@@ -66,10 +81,11 @@ export class Engine {
   }
   async preview(): Promise<Preview> {
     const snapshot = await this.remote.snapshot(); this.checkIdentity(snapshot);
-    const files = await this.local.scan();
-    const result = { upload: 0, download: 0, same: 0, conflicts: 0, local: files.size, remote: snapshot.files.length };
+    this.policy(snapshot.excludedPaths);
+    const files = await this.scan(), remoteFiles = snapshot.files.filter(file => !file.heads.some(head => this.isExcluded(head.path)));
+    const result = { upload: 0, download: 0, same: 0, conflicts: 0, local: files.size, remote: remoteFiles.length };
     const matched = new Set<string>();
-    for (const file of snapshot.files) {
+    for (const file of remoteFiles) {
       if (file.heads.length !== 1) { result.conflicts++; file.heads.forEach(h => matched.add(pathKey(h.path))); continue; }
       const head = file.heads[0], data = [...files].find(([p]) => pathKey(p) === pathKey(head.path));
       if (data) { matched.add(pathKey(data[0])); if (!head.deleted && data[0] === head.path && hash(data[1]) === head.hash) result.same++; else result.conflicts++; }
@@ -82,7 +98,7 @@ export class Engine {
     return this.exclusive(async () => {
       if (this.state.initialized) return;
       await this.snapshot();
-      const files = await this.local.scan();
+      const files = await this.scan();
       for (const [path, data] of files) this.bindUntracked(path, data);
       this.state.initialized = true;
       await this.save(this.state);
@@ -102,7 +118,7 @@ export class Engine {
     return this.exclusive(async () => {
       for (const e of Object.values(this.state.entries)) {
         if (e.materialized && (e.path === oldPath || e.path.startsWith(oldPath + '/'))) {
-          const next = path + e.path.slice(oldPath.length); validatePath(next); e.path = next;
+          const next = path + e.path.slice(oldPath.length); if (!this.isExcluded(next)) validatePath(next); e.path = next;
         }
       }
       await this.save(this.state);
@@ -123,6 +139,7 @@ export class Engine {
         const page = await this.remote.changes(this.state.cursor, this.state.epoch); this.checkIdentity(page);
         if (page.epoch !== this.state.epoch) throw new SyncError('resync_required', '服务端代次变化');
         if (page.more && page.cursor === this.state.cursor) throw new Error('远端分页游标未前进，已停止拉取');
+        this.policy(page.excludedPaths);
         for (const event of page.changes) this.state.remote[event.file.fileId] = event.file;
         this.state.cursor = page.cursor;
         await this.save(this.state); // Entire remote event payload is durable before advancing cursor.
@@ -136,11 +153,12 @@ export class Engine {
       content: content === null ? null : content.toString('base64') };
   }
   private async stage(): Promise<void> {
-    const files = await this.local.scan();
+    const files = await this.scan();
     const tracked = new Set(Object.values(this.state.entries).map(e => pathKey(e.path)));
     for (const [path, data] of files) if (!tracked.has(pathKey(path))) this.bindUntracked(path, data);
     const deletions: Pending[] = [];
     for (const e of Object.values(this.state.entries)) {
+      if (this.isExcluded(e.path)) continue;
       if (e.blocked && !e.materialized && !files.has(e.path)) delete e.blocked;
       if (e.blocked) { this.state.issues[e.fileId] = e.blocked; continue; }
       if (this.state.pending.some(p => p.revision.fileId === e.fileId)) continue;
@@ -155,7 +173,7 @@ export class Engine {
         if (!e.baseRevision || e.baseDeleted || hash(data) !== e.baseHash || e.path !== e.basePath) this.state.pending.push(this.makePending(e, data));
       } else if (e.materialized && !e.baseDeleted && e.baseRevision) deletions.push(this.makePending(e, null));
     }
-    const count = Object.values(this.state.entries).filter(e => !e.baseDeleted).length;
+    const count = Object.values(this.state.entries).filter(e => !e.baseDeleted && !this.isExcluded(e.path)).length;
     const protectedBatch = (deletions.length >= 10 && deletions.length / Math.max(count, 1) >= 0.1) || (deletions.length >= 5 && deletions.length / Math.max(count, 1) >= 0.2);
     const fingerprint = hash(JSON.stringify(deletions.map(p => [p.revision.fileId, p.revision.parents, p.revision.path]).sort()));
     if (protectedBatch && this.state.deleteApproval !== fingerprint) {
@@ -175,6 +193,7 @@ export class Engine {
   private async flush(): Promise<void> {
     for (const pending of [...this.state.pending]) {
       if (this.stopped) return;
+      if (this.isExcluded(pending.revision.path) || this.isExcluded(this.state.entries[pending.revision.fileId]?.path ?? pending.revision.path)) continue;
       try {
         if (pending.content !== null) {
           const data = Buffer.from(pending.content, 'base64');
@@ -205,9 +224,9 @@ export class Engine {
     delete this.state.applying; await this.save(this.state);
   }
   private async applyRemote(): Promise<void> {
-    const deletions = Object.values(this.state.remote).filter(f => f.heads.length === 1 && f.heads[0].deleted &&
+    const deletions = Object.values(this.state.remote).filter(f => f.heads.length === 1 && !this.isExcluded(f.heads[0].path) && !this.isExcluded(this.state.entries[f.fileId]?.path ?? f.heads[0].path) && f.heads[0].deleted &&
       this.state.entries[f.fileId]?.materialized && !this.state.entries[f.fileId].baseDeleted && this.state.entries[f.fileId].baseRevision !== f.heads[0].id);
-    const live = Object.values(this.state.entries).filter(e => !e.baseDeleted).length;
+    const live = Object.values(this.state.entries).filter(e => !e.baseDeleted && !this.isExcluded(e.path)).length;
     const fingerprint = hash('remote:' + JSON.stringify(deletions.map(f => f.heads[0].id).sort()));
     const blockDeletes = ((deletions.length >= 10 && deletions.length / Math.max(live, 1) >= 0.1) || (deletions.length >= 5 && deletions.length / Math.max(live, 1) >= 0.2)) && this.state.deleteApproval !== fingerprint;
     if (blockDeletes) {
@@ -217,6 +236,7 @@ export class Engine {
     for (const file of Object.values(this.state.remote)) {
       if (this.stopped) return;
       let e = this.state.entries[file.fileId];
+      if ((e && this.isExcluded(e.path)) || file.heads.some(head => this.isExcluded(head.path))) continue;
       if (file.heads.length !== 1) { this.state.issues[file.fileId] = '存在多个版本，请查看冲突'; continue; }
       const r = file.heads[0];
       if (blockDeletes && r.deleted) continue;
@@ -248,7 +268,9 @@ export class Engine {
     await this.stage();
     await this.save(this.state);
     const count = Object.keys(this.state.issues).length;
-    this.report(count ? `${count} 项需处理` : this.state.pending.length ? `待上传 ${this.state.pending.length} 项` : '已同步');
+    const held = this.state.pending.filter(p => this.isExcluded(p.revision.path) || this.isExcluded(this.state.entries[p.revision.fileId]?.path ?? p.revision.path)).length;
+    const uploading = this.state.pending.length - held;
+    this.report(count ? `${count} 项需处理` : uploading ? `待上传 ${uploading} 项` : held ? `已同步，${held} 项已排除并保留待上传快照` : '已同步');
   }
   retryRenamed(fileId: string): Promise<void> {
     return this.exclusive(async () => {
@@ -267,6 +289,7 @@ export class Engine {
       await this.pull();
       const e = this.state.entries[fileId], file = this.state.remote[fileId];
       if (!e || !file || !file.heads.length) throw new Error('无法找到文件版本');
+      if (this.isExcluded(e.path) || file.heads.some(head => this.isExcluded(head.path)) || (choice !== 'local' && this.isExcluded(choice.path))) throw new Error('该文件在排除规则内，请先调整规则再选择版本');
       const local = await this.local.read(e.path);
       if (local) await this.local.preserve(local);
       // Preserve even a not-yet-acknowledged upload before explicitly replacing it.

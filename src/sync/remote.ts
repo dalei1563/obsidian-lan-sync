@@ -1,4 +1,5 @@
 import { Changes, CommitResult, Cursor, hash, id, MAX_BYTES, PairResult, PROTOCOL, Revision, Snapshot, SyncError, validCursor, validateRevision } from '../../shared/protocol';
+import { normalizeExclusions } from '../../shared/exclusions';
 
 export interface HttpResponse { status: number; body: Buffer }
 export type Transport = (url: string, method: string, headers: Record<string, string>, body?: Buffer) => Promise<HttpResponse>;
@@ -26,12 +27,14 @@ export class Remote {
   async snapshot(): Promise<Snapshot> {
     const s = JSON.parse((await this.request(this.path('state'))).toString('utf8')) as Snapshot;
     if (s.protocol !== PROTOCOL || !Array.isArray(s.files) || !validCursor(s.cursor) || typeof s.epoch !== 'string' || typeof s.serverId !== 'string') throw new Error('服务端协议或快照无效');
+    if (s.excludedPaths !== undefined) s.excludedPaths = normalizeExclusions(s.excludedPaths);
     for (const file of s.files) { if (!file.heads.length) throw new Error('远端文件缺少版本'); file.heads = file.heads.map(validateRevision); if (file.heads.some(r => r.fileId !== file.fileId)) throw new Error('远端文件身份无效'); }
     return s;
   }
   async changes(cursor: Cursor, epoch: string): Promise<Changes> {
     const c = JSON.parse((await this.request(this.path(`changes?after=${encodeURIComponent(cursor)}&epoch=${encodeURIComponent(epoch)}`))).toString('utf8')) as Changes;
     if (!Array.isArray(c.changes) || !validCursor(c.cursor)) throw new Error('远端游标无效');
+    if (c.excludedPaths !== undefined) c.excludedPaths = normalizeExclusions(c.excludedPaths);
     for (const event of c.changes) {
       if (!validCursor(event.seq) || !event.file.heads.length || (typeof cursor === 'number' && typeof event.seq === 'number' && event.seq <= cursor)) throw new Error('远端事件无效');
       event.file.heads = event.file.heads.map(validateRevision);

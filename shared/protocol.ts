@@ -31,6 +31,7 @@ export interface Snapshot {
   epoch: string;
   cursor: Cursor;
   files: FileState[];
+  excludedPaths?: string[];
 }
 export interface Changes {
   serverId: string;
@@ -38,6 +39,7 @@ export interface Changes {
   cursor: Cursor;
   more: boolean;
   changes: { seq: Cursor; file: FileState }[];
+  excludedPaths?: string[];
 }
 export interface CommitResult { revision: Revision; file: FileState; seq: Cursor }
 export interface PairResult { token: string; deviceId: string; vaultId: string; vaultName: string; serverId: string }

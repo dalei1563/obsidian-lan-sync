@@ -3,6 +3,8 @@ import { mkdirSync, existsSync, readFileSync, writeFileSync, appendFileSync, ope
 import { join, resolve, sep } from 'node:path';
 import { assertHash, assertId, Changes, CommitResult, Cursor, FileState, hash, id, MAX_BYTES, MAX_FILES, PairResult, pathsOverlap, PROTOCOL, Revision, Snapshot, SyncError, validateRevision, validCursor } from '../shared/protocol';
 import type { Backend, DeviceInfo } from './backend';
+import { ActivityPage, VaultSummary, activityId, activityLimit, managementName, parseActivityCursor, revisionAction, summarizeFiles } from '../shared/management';
+import { normalizeExclusions, isExcluded } from '../shared/exclusions';
 
 export interface CouchOptions { url: string; user: string; password: string; database: string; root: string }
 type Doc = Record<string, any>;
@@ -105,6 +107,62 @@ export class CouchStore implements Backend {
     }
     return { fileId, heads: [...heads.values()].sort((a, b) => a.id.localeCompare(b.id)) };
   }
+  private async vault(vaultId: string): Promise<Doc> {
+    assertId(vaultId); const vault = await this.doc('vault:' + vaultId);
+    if (!vault || vault.type !== 'vault') throw new SyncError('vault_missing', '仓库不存在', 404);
+    return vault;
+  }
+  private async exclusions(vaultId: string): Promise<string[]> { return normalizeExclusions((await this.vault(vaultId)).excludedPaths ?? []); }
+  createVault(name: string): Promise<{ id: string; name: string }> {
+    return this.serial(async () => {
+      const result = { id: id(), name: managementName(name) };
+      await this.put({ _id: 'vault:' + result.id, type: 'vault', vaultId: result.id, name: result.name, createdAt: Date.now(), excludedPaths: [] });
+      return result;
+    });
+  }
+  renameVault(vaultId: string, name: string): Promise<void> {
+    return this.serial(async () => { const vault = await this.vault(vaultId); await this.put({ ...vault, name: managementName(name) }); });
+  }
+  setExclusions(vaultId: string, input: unknown): Promise<string[]> {
+    return this.serial(async () => { const vault = await this.vault(vaultId), rules = normalizeExclusions(input); await this.put({ ...vault, excludedPaths: rules }); return rules; });
+  }
+  listVaults(): Promise<VaultSummary[]> {
+    return this.serial(async () => {
+      await this.refresh(); const vaults = await this.prefix('vault:'), devices = await this.prefix('device:');
+      const revisionCounts = new Map<string, number>(), deviceCounts = new Map<string, number>();
+      for (const { doc } of this.records.values()) revisionCounts.set(doc.vaultId, (revisionCounts.get(doc.vaultId) ?? 0) + 1);
+      for (const device of devices) if (!device.revoked) deviceCounts.set(device.vaultId, (deviceCounts.get(device.vaultId) ?? 0) + 1);
+      return vaults.map(vault => {
+        const files = [...(this.files.get(vault.vaultId)?.keys() ?? [])].map(fileId => this.file(vault.vaultId, fileId));
+        return { id: vault.vaultId, name: vault.name, createdAt: typeof vault.createdAt === 'number' ? vault.createdAt : null, ...summarizeFiles(files),
+          revisionCount: revisionCounts.get(vault.vaultId) ?? 0,
+          devices: deviceCounts.get(vault.vaultId) ?? 0,
+          excludedPaths: normalizeExclusions(vault.excludedPaths ?? []) };
+      }).sort((a, b) => (b.createdAt ?? 0) - (a.createdAt ?? 0) || a.id.localeCompare(b.id));
+    });
+  }
+  activity(vaultId?: string, before?: string, limit = 50): Promise<ActivityPage> {
+    return this.serial(async () => {
+      activityLimit(limit); if (vaultId !== undefined) await this.vault(vaultId);
+      await this.refresh(); const vaults = new Map((await this.prefix('vault:')).map(v => [v.vaultId, v.name]));
+      const devices = new Map((await this.prefix('device:')).map(d => [d.id, d.name]));
+      const list = [...this.records.values()].filter(row => vaultId === undefined || row.doc.vaultId === vaultId).reverse();
+      let start = 0;
+      if (before !== undefined) {
+        const [vid, rid] = parseActivityCursor(before);
+        if (vaultId !== undefined && vid !== vaultId) throw new SyncError('invalid_cursor', '变更记录游标不属于当前仓库', 400);
+        start = list.findIndex(r => r.doc.vaultId === vid && r.doc.revision.id === rid) + 1;
+        if (!start) throw new SyncError('invalid_cursor', '变更记录游标已失效，请重新加载', 400);
+      }
+      const items = list.slice(start, start + limit).map(({ doc }) => {
+        const r = doc.revision;
+        return { id: activityId(doc.vaultId, r.id), vaultId: doc.vaultId, vaultName: vaults.get(doc.vaultId) ?? '未知仓库', fileId: r.fileId, path: r.path,
+          action: revisionAction(r, parent => this.records.get(this.key(doc.vaultId, 'revision', parent))?.doc.revision),
+          deviceId: r.clientId, deviceName: devices.get(r.clientId) ?? '未知设备', bytes: r.size, createdAt: typeof doc.createdAt === 'number' ? doc.createdAt : null };
+      });
+      return { items, nextCursor: list.length > start + limit ? items[items.length - 1].id : null };
+    });
+  }
   createPair(name: string, vaultId?: string): Promise<{ code: string; vaultId: string; expires: number }> {
     return this.serial(async () => {
       if (!name.trim() || name.length > 100) throw new Error('Vault name required (max 100 characters)');
@@ -112,7 +170,7 @@ export class CouchStore implements Backend {
       const vaultKey = 'vault:' + vid;
       if (!await this.doc(vaultKey)) {
         if (vaultId) throw new Error('指定的远端笔记库不存在，请检查 Vault ID');
-        await this.put({ _id: vaultKey, type: 'vault', name, vaultId: vid });
+        await this.put({ _id: vaultKey, type: 'vault', name, vaultId: vid, createdAt: Date.now(), excludedPaths: [] });
       }
       const code = randomBytes(12).toString('hex'), expires = Date.now() + 10 * 60 * 1000;
       await this.put({ _id: 'pair:' + hash(code), type: 'pair', vaultId: vid, deviceId: id(), expires });
@@ -169,7 +227,7 @@ export class CouchStore implements Backend {
   snapshot(vaultId: string): Promise<Snapshot> {
     return this.serial(async () => { await this.refresh(); const files = [...(this.files.get(vaultId)?.keys() ?? [])].sort().map(f => this.file(vaultId, f));
       if (files.length > MAX_FILES) throw new SyncError('vault_too_large', '文件数量超过首版上限', 413);
-      return { protocol: PROTOCOL, serverId: this.serverId, epoch: this.epoch, cursor: this.cursor, files }; });
+      return { protocol: PROTOCOL, serverId: this.serverId, epoch: this.epoch, cursor: this.cursor, files, excludedPaths: await this.exclusions(vaultId) }; });
   }
   changes(vaultId: string, after: Cursor, epoch: string): Promise<Changes> {
     return this.serial(async () => {
@@ -179,7 +237,7 @@ export class CouchStore implements Backend {
       catch (e) { if (e instanceof SyncError && e.code === 'couch_bad_request') throw new SyncError('resync_required', '数据库游标已失效，请重新核对'); throw e; }
       const changes = [];
       for (const row of page.results) if (row.doc?.type === 'revision' && row.doc.vaultId === vaultId) changes.push({ seq: row.seq as Cursor, file: this.file(vaultId, row.doc.revision.fileId) });
-      return { serverId: this.serverId, epoch: this.epoch, cursor: page.last_seq, more: page.pending > 0, changes };
+      return { serverId: this.serverId, epoch: this.epoch, cursor: page.last_seq, more: page.pending > 0, changes, excludedPaths: await this.exclusions(vaultId) };
     });
   }
   commit(vaultId: string, input: unknown, deviceId: string): Promise<CommitResult> {
@@ -188,6 +246,7 @@ export class CouchStore implements Backend {
       if (revision.clientId !== deviceId) throw new SyncError('wrong_device', '修订必须属于当前设备', 403);
       await this.refresh(); const key = this.key(vaultId, 'revision', revision.id), previous = this.records.get(key);
       if (previous) { if (JSON.stringify(previous.doc.revision) !== JSON.stringify(revision)) throw new SyncError('idempotency_conflict', '修订标识被用于不同内容'); return { revision, file: previous.doc.fileAfter, seq: previous.seq }; }
+      if (isExcluded(revision.path, await this.exclusions(vaultId))) throw new SyncError('path_excluded', '该路径已被仓库排除规则暂停同步', 409);
       const existing = this.file(vaultId, revision.fileId);
       if (existing.heads.length && !revision.parents.length) throw new SyncError('missing_parent', '已有文件不能创建第二个无父版本');
       if (!existing.heads.length && (this.files.get(vaultId)?.size ?? 0) >= MAX_FILES) throw new SyncError('vault_too_large', '文件数量达到首版上限', 413);
@@ -198,7 +257,7 @@ export class CouchStore implements Backend {
         for (const fileId of this.files.get(vaultId)?.keys() ?? []) if (fileId !== revision.fileId && this.file(vaultId, fileId).heads.some(h => !h.deleted && pathsOverlap(h.path, revision.path))) throw new SyncError('path_conflict', '目标路径已被其他逻辑文件占用');
       }
       const fileAfter = { fileId: revision.fileId, heads: [...existing.heads.filter(h => !revision.parents.includes(h.id)), revision].sort((a, b) => a.id.localeCompare(b.id)) };
-      const doc: RevisionDoc = { _id: key, type: 'revision', vaultId, revision, fileAfter };
+      const doc: RevisionDoc = { _id: key, type: 'revision', vaultId, revision, fileAfter, createdAt: Date.now() };
       try { await this.put(doc); }
       catch (e) {
         // An ambiguous write must be reconciled, never followed by a new revision ID.

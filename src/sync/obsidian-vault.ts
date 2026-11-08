@@ -4,6 +4,7 @@ import { join, relative, resolve, sep } from 'node:path';
 import { hash, MAX_BYTES, MAX_FILES, pathKey, validatePath } from '../../shared/protocol';
 import { ApplyRequest, LocalVault } from './engine';
 import { DiskState } from './disk-state';
+import { isExcluded } from '../../shared/exclusions';
 
 export class ObsidianVault implements LocalVault {
   applying = false;
@@ -23,11 +24,12 @@ export class ObsidianVault implements LocalVault {
       if (existsSync(current) && lstatSync(current).isSymbolicLink()) throw new Error(`不支持符号链接：${path}`);
     }
   }
-  async scan(): Promise<Map<string, Buffer>> {
+  async scan(accept?: (path: string) => boolean): Promise<Map<string, Buffer>> {
     const result = new Map<string, Buffer>(), keys = new Set<string>(); let total = 0;
     const files = this.app.vault.getMarkdownFiles();
     if (files.length > MAX_FILES) throw new Error('首版最多支持 10000 个 Markdown 文件');
     for (const file of files) {
+      if (isExcluded(file.path, [], this.app.vault.configDir) || (accept && !accept(file.path))) continue;
       this.safe(file.path);
       if (keys.has(pathKey(file.path))) throw new Error(`文件路径大小写冲突：${file.path}`);
       keys.add(pathKey(file.path));

@@ -8,6 +8,7 @@ FROM node:24.15.0-bookworm-slim
 WORKDIR /app
 COPY --from=build /app/dist/server/cli.cjs ./dist/server/cli.cjs
 COPY --from=build /app/dist/distribution ./dist/distribution
+COPY --from=build /app/dist/admin ./dist/admin
 RUN mkdir /data && chown node:node /data
 USER node
 ENV SYNC_DATA_DIR=/data SYNC_HOST=0.0.0.0 SYNC_PORT=27123 SYNC_ASSETS_DIR=/app/dist/distribution

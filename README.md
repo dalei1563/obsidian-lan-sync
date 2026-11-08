@@ -1,4 +1,4 @@
-# LAN Note Sync 0.3：CouchDB + 独立 Obsidian 插件
+# LAN Note Sync 0.4：CouchDB + 独立 Obsidian 插件
 
 目标是把配置留在服务端：管理员部署一次，Windows 和 macOS 用户运行一条安装命令、选择笔记库，在 Obsidian 中启用插件并确认首次同步。
 
@@ -6,7 +6,7 @@
 
 ## 部署和接入
 
-**Rocky Linux / 1Panel 镜像部署**：0.3.1 双架构镜像已发布到 `ghcr.io/dalei1563/obsidian-lan-sync` 和同名 `-couchdb` 包。0.3.1 修复 Tailscale 安装时的代理绕过问题，已完成[跨主机测试](docs/TAILSCALE_TEST_REPORT.md)。使用 [GHCR 和 1Panel 指南](docs/ONEPANEL_GHCR.md) 及 `compose.production.yaml`；以下为本地源码构建方式。
+**Rocky Linux / 1Panel 镜像部署**：使用 [GHCR 和 1Panel 指南](docs/ONEPANEL_GHCR.md) 及 `compose.production.yaml`；以下为本地源码构建方式。0.4 新增[管理员后台、多仓库和排除规则](docs/ADMIN_GUIDE.md)，浏览器打开服务地址的 `/admin/` 即可管理。
 
 数据盘安装可在快捷 SSH 安装命令末尾加 `--data-dir /data/lan-note-sync`，将数据库、网关状态和部署配置都放到该目录；已有部署不会自动迁移，详见指南。
 
@@ -36,7 +36,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\deployment\setup.ps1 -Publ
 bash deployment/setup.sh --public-url http://192.168.1.10:27123 --expose-lan
 ```
 
-正式部署使用可信 HTTPS 地址和反向代理。脚本不会自动申请域名、配置公网穿透或处理防火墙。已有 `.env` 会保留；更改地址和监听范围的方法见[部署说明](docs/SERVER_QUICKSTART.md)。
+局域网和 Tailscale 可直接使用 HTTP；公开到互联网时使用 HTTPS。脚本不会自动申请域名、配置公网穿透或处理防火墙。已有 `.env` 会保留；更改地址和监听范围的方法见[部署说明](docs/SERVER_QUICKSTART.md)。
 
 管理员把生成的对应系统安装命令发给用户。用户无需填写数据库地址、账号、密码或同步参数：
 
@@ -57,6 +57,8 @@ docker compose exec -T sync node dist/server/cli.cjs invite
 
 ## 当前功能和范围
 
+- 一个管理员密码管理后台：总览、独立仓库、一次性设备接入、修订记录、撤销授权与排除同步。
+- 每个本地 Vault 独立绑定；多个 Vault 可连接同一个服务，远端数据按仓库隔离。
 - Markdown 新建、修改、移动、删除；保留 UTF-8 原始字节、BOM、CRLF 和空笔记。
 - 离线后重试、提交幂等、并发冲突保留、显式版本选择、历史预览及恢复。
 - 首次同步预览、发送和接收两侧的批量删除确认、本地替换快照、打开中的笔记延迟替换。
