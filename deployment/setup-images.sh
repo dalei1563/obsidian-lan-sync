@@ -1,7 +1,7 @@
 #!/bin/bash
 # Rocky Linux / 1Panel: download images only; no Node, npm or source build.
 set -eu
-prefix=''; public_url=''; version='0.4.1'; output='/opt/lan-note-sync'; output_set=0; data_dir=''; prepare_only=0; upgrade=0; listen=127.0.0.1
+prefix=''; public_url=''; version='0.4.2'; output='/opt/lan-note-sync'; output_set=0; data_dir=''; prepare_only=0; upgrade=0; listen=127.0.0.1
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --image-prefix) prefix=$2; shift 2;;
@@ -16,7 +16,7 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 [[ "$prefix" =~ ^[a-z0-9.-]+(:[0-9]+)?/[a-z0-9._/-]+$ ]] || { printf '%s\n' 'Specify --image-prefix, for example ghcr.io/account/obsidian-lan-sync.' >&2; exit 1; }
-[[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { printf '%s\n' 'Use a published fixed version, for example 0.4.1.' >&2; exit 1; }
+[[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { printf '%s\n' 'Use a published fixed version, for example 0.4.2.' >&2; exit 1; }
 if [ -n "$public_url" ]; then
   [[ "$public_url" =~ ^https?://[a-zA-Z0-9.-]+(:[0-9]+)?/?$ ]] || { printf '%s\n' 'Expected a root HTTP(S) URL your devices can reach.' >&2; exit 1; }
 fi

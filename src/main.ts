@@ -226,7 +226,8 @@ export default class LanSyncPlugin extends Plugin {
     new Setting(modal.contentEl).addButton(b => b.setButtonText('取消').onClick(() => modal.close())).addButton(b => b.setButtonText('确认并开始同步').setCta().onClick(() => {
       b.setDisabled(true); void this.action(async () => {
         this.ensureActive(); await this.engine!.initialize(); this.ensureActive(); this.settings.enabled = true; await this.saveSettings(); this.ensureActive(); modal.close(); this.refreshSettings(); await this.sync(true);
-      }).finally(() => b.setDisabled(false));
+      // Obsidian controls are thenable; Promise callbacks must not return them.
+      }).finally((): void => { if (!this.disposed) b.setDisabled(false); });
     }));
     this.previewDialog = modal;
     try { await this.openMainModal(modal); } catch (e) { this.previewDialog = undefined; throw e; }
@@ -289,7 +290,7 @@ export default class LanSyncPlugin extends Plugin {
     const modal = new Modal(this.app); modal.titleEl.setText('确认使用所选版本');
     modal.contentEl.createEl('p', { text: `将使用“${label}”创建新版本。原版本保留，可从历史恢复。` });
     new Setting(modal.contentEl).addButton(b => b.setButtonText('取消').onClick(() => modal.close())).addButton(b => b.setButtonText('确认选择').setCta().onClick(() => {
-      b.setDisabled(true); void this.action(async () => { await this.engine!.resolve(fileId, choice); modal.close(); parent.close(); await this.sync(true); }).finally(() => b.setDisabled(false));
+      b.setDisabled(true); void this.action(async () => { await this.engine!.resolve(fileId, choice); modal.close(); parent.close(); await this.sync(true); }).finally((): void => { if (!this.disposed) b.setDisabled(false); });
     })); modal.open();
   }
   private async previewRevision(parent: Modal, fileId: string, revision: Revision): Promise<void> {

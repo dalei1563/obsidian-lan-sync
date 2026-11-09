@@ -66,7 +66,7 @@ test('a successful request clears its deadline and a native error keeps its orig
 
 // Compile the real plugin with its only runtime dependency stubbed. This checks
 // the enrollment orchestration without opening a user Vault or starting sync.
-const compile = spawnSync(process.execPath, ['-e', "process.stdout.write(require('esbuild').buildSync({entryPoints:['src/main.ts'],bundle:true,platform:'node',format:'cjs',target:'node24',external:['obsidian'],write:false}).outputFiles[0].text)"], { encoding: 'utf8', windowsHide: true, maxBuffer: 4 * 1024 * 1024 });
+const compile = spawnSync(process.execPath, ['-e', "process.stdout.write(require('esbuild').buildSync({stdin:{contents:\"export {default} from './src/main'; export {LanSettingTab} from './src/settings';\",resolveDir:process.cwd(),sourcefile:'pairing-test.ts'},bundle:true,platform:'node',format:'cjs',target:'node24',external:['obsidian'],write:false}).outputFiles[0].text)"], { encoding: 'utf8', windowsHide: true, maxBuffer: 4 * 1024 * 1024 });
 assert.equal(compile.status, 0, compile.stderr);
 const requireRuntime = createRequire(resolve('package.json'));
 const server = 'http://127.0.0.1:27123', codeA = 'a'.repeat(24), codeB = 'b'.repeat(24);
@@ -75,21 +75,47 @@ function reply(name: string) {
   return { status: 200, arrayBuffer: Uint8Array.from(Buffer.from(JSON.stringify(result))).buffer };
 }
 function pluginFixture(request: (options: any) => Promise<any>) {
-  const notices: string[] = [], secretWrites: string[] = [], claims = new Map<string, string>(), modals: any[] = []; let completed = 0, setups = 0, previews = 0, syncs = 0;
+  const notices: string[] = [], secretWrites: string[] = [], claims = new Map<string, string>(), modals: any[] = [], buttons: any[] = [], textAreas: any[] = []; let completed = 0, setups = 0, previews = 0, syncs = 0;
   const app = { secretStorage: { setSecret: (_: string, value: string) => secretWrites.push(value) } };
   class Plugin { constructor(readonly app: unknown, readonly manifest: unknown) {} }
+  class Element {
+    buttons: any[] = []; children: Element[] = []; isConnected = true; style = {};
+    createEl(_: string, __?: unknown) { const child = new Element(); this.children.push(child); return child; }
+    createDiv(_: unknown) { return this.createEl('div'); }
+    empty() { this.children = []; this.buttons = []; } addClass(_: string) {} setText(_: string) {} setAttribute(_: string, __: string) {}
+  }
   class Modal {
-    titleEl = { setText: () => {} }; contentEl = { createEl: () => {}, buttons: [] as any[] }; onClose() {}
-    open() { modals.push(this); } close() { this.onClose(); }
+    titleEl = new Element(); contentEl = new Element(); isOpen = false; onClose() {}
+    open() { this.isOpen = true; modals.push(this); } close() { this.isOpen = false; this.onClose(); }
+  }
+  class PluginSettingTab { containerEl = new Element(); constructor(readonly app: unknown, readonly plugin: unknown) {} }
+  class BaseComponent {
+    thenCalls = 0;
+    // This is Obsidian's builder callback, not Promise.then. Returning the
+    // component from Promise.finally recursively resolves it with itself.
+    then(callback: (component: this) => void) { this.thenCalls++; callback(this); return this; }
+  }
+  class ButtonComponent extends BaseComponent {
+    text = ''; disabled = false; disabledHistory: boolean[] = []; click: () => void = () => {};
+    setButtonText(text: string) { this.text = text; return this; }
+    setCta() { return this; } setWarning() { return this; }
+    setDisabled(value: boolean) { this.disabled = value; this.disabledHistory.push(value); return this; }
+    onClick(click: () => void) { this.click = click; return this; }
   }
   class Setting {
     constructor(readonly element: { buttons: any[] }) {}
+    setName(_: string) { return this; } setDesc(_: string) { return this; }
     addButton(build: (button: any) => unknown) {
-      const button = { text: '', click: () => {}, setButtonText(text: string) { this.text = text; return this; }, setCta() { return this; }, setDisabled(_: boolean) { return this; }, onClick(click: () => void) { this.click = click; return this; } };
-      build(button); this.element.buttons.push(button); return this;
+      const button = new ButtonComponent();
+      build(button); this.element.buttons.push(button); buttons.push(button); return this;
     }
+    addTextArea(build: (input: any) => void) {
+      const input = { inputEl: { rows: 0, style: {}, setAttribute: () => {} }, change: (_: string) => {}, setValue(_: string) { return this; }, setPlaceholder(_: string) { return this; }, onChange(change: (value: string) => void) { this.change = change; return this; } };
+      build(input); textAreas.push(input); return this;
+    }
+    addToggle(build: (input: any) => void) { build({ setValue() { return this; }, setDisabled() { return this; }, onChange() { return this; } }); return this; }
   }
-  const obsidian = { Plugin, PluginSettingTab: class {}, FileSystemAdapter: class {}, MarkdownView: class {}, Modal, Setting, Notice: class { constructor(message: string) { notices.push(message); } }, requestUrl: request };
+  const obsidian = { Plugin, PluginSettingTab, FileSystemAdapter: class {}, MarkdownView: class {}, Modal, Setting, Notice: class { constructor(message: string) { notices.push(message); } }, requestUrl: request };
   const module = { exports: {} as any };
   new Function('require', 'module', 'exports', compile.stdout)(
     (name: string) => name === 'obsidian' ? obsidian : requireRuntime(name), module, module.exports);
@@ -104,7 +130,28 @@ function pluginFixture(request: (options: any) => Promise<any>) {
   plugin.preview = async () => { previews++; };
   plugin.sync = async () => { syncs++; };
   plugin.openMainModal = async (modal: Modal) => { modal.open(); };
-  return { plugin, notices, secretWrites, saves, claims, modals, get completed() { return completed; }, get setups() { return setups; }, get previews() { return previews; }, get syncs() { return syncs; } };
+  return { plugin, notices, secretWrites, saves, claims, modals, buttons, textAreas, createSettingTab: () => new module.exports.LanSettingTab(app, plugin), get completed() { return completed; }, get setups() { return setups; }, get previews() { return previews; }, get syncs() { return syncs; } };
+}
+
+// An SDK thenable returned by finally starves both timers and node:test's own
+// timeout. Run click handlers in a separate process so the parent can kill a
+// regression even when the child's event loop never reaches another macrotask.
+function isolatedUi(scenario: (fixture: typeof pluginFixture, check: typeof assert, connection: string, response: ReturnType<typeof reply>) => Promise<void>) {
+  const script = `
+    const { createRequire } = require('node:module');
+    const { resolve } = require('node:path');
+    const requireRuntime = createRequire(resolve('package.json'));
+    const compile = { stdout: ${JSON.stringify(compile.stdout)} };
+    const pluginFixture = (${pluginFixture.toString()});
+    const reply = (${reply.toString()});
+    Promise.resolve().then(() => (${scenario.toString()})(pluginFixture, require('node:assert/strict'), ${JSON.stringify(encodeConnection(server, codeA))}, reply('ui-paired')))
+      .then(() => setTimeout(() => process.stdout.write('ui-flow-complete'), 0))
+      .catch(error => { console.error(error); process.exitCode = 1; });
+  `;
+  const result = spawnSync(process.execPath, ['-'], { input: script, encoding: 'utf8', timeout: 5000, windowsHide: true, maxBuffer: 1024 * 1024 });
+  assert.equal(result.error, undefined, `UI subprocess failed or stopped responding: ${result.error?.message ?? ''}\n${result.stderr}`);
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.stdout, 'ui-flow-complete', 'UI flow must reach another event-loop turn after button cleanup');
 }
 
 test('actual plugin shares bootstrap/manual pairing, rejects another code, and never starts first sync', async () => {
@@ -194,4 +241,109 @@ test('canceling the actual first-sync preview keeps the binding and permits anot
   await f.plugin.preview(); assert.equal(f.modals.length, 1); f.modals[0].close();
   assert.equal(f.plugin.settings.vaultId, 'saved-vault'); assert.equal(f.plugin.settings.enabled, false); assert.equal(initializations, 0); assert.equal(f.syncs, 0);
   await f.plugin.preview(); assert.equal(f.modals.length, 2); assert.equal(previews, 2); assert.equal(initializations, 0); f.modals[1].close();
+});
+
+test('first-sync confirmation saves, starts sync, and restores the SDK thenable button without freezing', () => {
+  isolatedUi(async (fixture, check: typeof assert) => {
+    const f = fixture(async () => { throw new Error('unexpected request'); });
+    let initialize!: () => void, initializations = 0;
+    const pending = new Promise<void>(resolve => { initialize = resolve; });
+    f.plugin.settings.vaultId = 'saved-vault';
+    const state = { initialized: false };
+    f.plugin.engine = {
+      state, preview: async () => ({ local: 1, remote: 1, upload: 1, download: 1, same: 0, conflicts: 0 }),
+      initialize: async () => { initializations++; await pending; state.initialized = true; },
+    };
+    f.plugin.setup = async () => {};
+    f.plugin.preview = Object.getPrototypeOf(f.plugin).preview.bind(f.plugin);
+    await f.plugin.preview();
+    const modal = f.modals[0], button = modal.contentEl.buttons.find((b: any) => b.text === '确认并开始同步');
+    check.equal(initializations, 0); check.equal(f.syncs, 0);
+    button.click();
+    check.equal(button.disabled, true); check.equal(initializations, 1); check.equal(f.saves.length, 0);
+    initialize(); await new Promise<void>(resolve => setImmediate(resolve));
+    check.equal(state.initialized, true); check.equal(f.plugin.settings.enabled, true);
+    check.equal(f.saves.length, 1); check.equal(f.saves[0].enabled, true); check.equal(f.syncs, 1);
+    check.equal(modal.isOpen, false); check.equal(button.disabled, false);
+    check.deepEqual(button.disabledHistory, [true, false]); check.equal(button.thenCalls, 0);
+  });
+});
+
+test('failed first-sync confirmation reports the error, restores the thenable button, and can retry', () => {
+  isolatedUi(async (fixture, check: typeof assert) => {
+    const f = fixture(async () => { throw new Error('unexpected request'); });
+    let initializations = 0;
+    f.plugin.settings.vaultId = 'saved-vault';
+    const state = { initialized: false };
+    f.plugin.engine = {
+      state, preview: async () => ({ local: 1, remote: 0, upload: 1, download: 0, same: 0, conflicts: 0 }),
+      initialize: async () => { if (++initializations === 1) throw new Error('initialization failed'); state.initialized = true; },
+    };
+    f.plugin.setup = async () => {};
+    f.plugin.preview = Object.getPrototypeOf(f.plugin).preview.bind(f.plugin);
+    await f.plugin.preview();
+    const modal = f.modals[0], button = modal.contentEl.buttons.find((b: any) => b.text === '确认并开始同步');
+    button.click(); check.equal(button.disabled, true);
+    await new Promise<void>(resolve => setImmediate(resolve));
+    check.equal(modal.isOpen, true); check.equal(button.disabled, false); check.equal(button.thenCalls, 0);
+    check.equal(state.initialized, false); check.equal(f.plugin.settings.enabled, false);
+    check.equal(f.saves.length, 0); check.equal(f.syncs, 0); check.deepEqual(f.notices, ['initialization failed']);
+    button.click(); check.equal(button.disabled, true);
+    await new Promise<void>(resolve => setImmediate(resolve));
+    check.equal(initializations, 2); check.equal(f.syncs, 1); check.equal(modal.isOpen, false);
+    check.deepEqual(button.disabledHistory, [true, false, true, false]); check.equal(button.thenCalls, 0);
+  });
+});
+
+test('conflict confirmation restores SDK thenable buttons after both successful and failed resolution', () => {
+  isolatedUi(async (fixture, check: typeof assert) => {
+    for (const fail of [false, true]) {
+      const f = fixture(async () => { throw new Error('unexpected request'); });
+      const resolutions: unknown[] = [];
+      f.plugin.engine = {
+        state: { initialized: true, issues: { 'note-id': 'conflicting versions' }, entries: { 'note-id': { path: 'note.md' } }, remote: { 'note-id': { heads: [] } }, pending: [] },
+        resolve: async (fileId: string, choice: string) => { resolutions.push([fileId, choice]); if (fail) throw new Error('resolution failed'); },
+      };
+      await f.plugin.showIssues();
+      const parent = f.modals[0];
+      f.buttons.find((b: any) => b.text === '选择本地').click();
+      const modal = f.modals[1], button = modal.contentEl.buttons.find((b: any) => b.text === '确认选择');
+      button.click(); check.equal(button.disabled, true);
+      await new Promise<void>(resolve => setImmediate(resolve));
+      check.deepEqual(resolutions, [['note-id', 'local']]);
+      check.equal(button.disabled, false); check.deepEqual(button.disabledHistory, [true, false]); check.equal(button.thenCalls, 0);
+      check.equal(parent.isOpen, fail); check.equal(modal.isOpen, fail); check.equal(f.syncs, fail ? 0 : 1);
+      check.deepEqual(f.notices, fail ? ['resolution failed'] : []);
+    }
+  });
+});
+
+test('settings connection, preview, and exclusions restore thenable buttons on success and error', () => {
+  isolatedUi(async (fixture, check: typeof assert, connection, response) => {
+    for (const text of ['连接并预览', '预览首次同步', '保存排除规则']) {
+      for (const fail of [false, true]) {
+        const f = fixture(async () => { if (fail) throw new Error('connection failed'); return response; });
+        if (text === '预览首次同步') {
+          f.plugin.settings.vaultId = 'saved-vault';
+          f.plugin.engine = { state: { initialized: false } };
+          if (fail) f.plugin.preview = async () => { throw new Error('preview failed'); };
+        }
+        if (text === '保存排除规则' && fail) f.plugin.saveSettings = async () => { throw new Error('disk full'); };
+        const tab = f.createSettingTab(); tab.display();
+        if (text === '连接并预览') f.textAreas[0].change(connection);
+        if (text === '保存排除规则') f.textAreas[f.textAreas.length - 1].change('private/\n*.tmp.md');
+        const button = f.buttons.find((b: any) => b.text === text);
+        button.click(); check.equal(button.disabled, true);
+        await new Promise<void>(resolve => setImmediate(resolve));
+        check.equal(button.disabled, false, text); check.equal(button.thenCalls, 0, text);
+        check.deepEqual(button.disabledHistory.slice(-2), [true, false], text);
+        check.equal(f.notices.length, fail || text === '连接并预览' ? 1 : 0, text);
+        if (fail) check.match(f.notices[0], /无法连接同步服务|preview failed|disk full/);
+        else if (text === '连接并预览') { check.equal(f.plugin.settings.vaultId, 'ui-paired-vault'); check.equal(f.previews, 1); }
+        else if (text === '预览首次同步') check.equal(f.previews, 1);
+        else { check.deepEqual(f.saves[0].excludedPaths, ['private/**', '*.tmp.md']); check.equal(f.plugin.status, '排除规则已保存'); }
+        check.equal(f.syncs, 0);
+      }
+    }
+  });
 });

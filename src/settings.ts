@@ -30,12 +30,12 @@ export class LanSettingTab extends PluginSettingTab {
         t.setValue(this.connectionDraft).setPlaceholder('lansync:…').onChange(v => { this.connectionDraft = v; }); t.inputEl.rows = 3; t.inputEl.style.width = '100%'; t.inputEl.setAttribute('spellcheck', 'false');
       });
       new Setting(containerEl).addButton(b => b.setButtonText(plugin.connecting ? '正在连接…' : '连接并预览').setDisabled(plugin.connecting).setCta().onClick(() => {
-        b.setDisabled(true); void plugin.action(() => plugin.importConnection(this.connectionDraft.trim())).finally(() => { if (!plugin.unloaded) { b.setDisabled(false); this.refreshBinding(); } });
+        b.setDisabled(true); void plugin.action(() => plugin.importConnection(this.connectionDraft.trim())).finally((): void => { if (!plugin.unloaded) { b.setDisabled(false); this.refreshBinding(); } });
       }));
     } else {
       card.createEl('p', { text: `已连接：${plugin.settings.vaultName}` });
       if (!plugin.engine?.state.initialized) new Setting(containerEl).setName('首次同步').setDesc('绑定已保存。先确认要上传、下载的笔记，再开始；预览失败可直接重试，无需再次输入连接码。').addButton(b => b.setButtonText(plugin.previewing ? '正在获取预览…' : '预览首次同步').setDisabled(plugin.previewing).setCta().onClick(() => {
-        b.setDisabled(true); void plugin.action(() => plugin.preview()).finally(() => { if (!plugin.unloaded) { b.setDisabled(false); this.refreshBinding(); } });
+        b.setDisabled(true); void plugin.action(() => plugin.preview()).finally((): void => { if (!plugin.unloaded) { b.setDisabled(false); this.refreshBinding(); } });
       }));
       new Setting(containerEl).setName('自动同步').setDesc('正常写作即可；断网后会在恢复连接时重试。').addToggle(t => t.setValue(plugin.settings.enabled).setDisabled(!plugin.engine?.state.initialized).onChange(async enabled => {
         plugin.settings.enabled = enabled; await plugin.saveSettings(); plugin.setStatus(enabled ? '等待同步' : '自动同步已暂停'); if (enabled) await plugin.sync(true);
@@ -52,7 +52,7 @@ export class LanSettingTab extends PluginSettingTab {
       b.setDisabled(true); void plugin.action(async () => {
         plugin.settings.excludedPaths = normalizeExclusions(this.exclusionDraft!.split(/\r?\n/)); await plugin.saveSettings(); this.exclusionDraft = plugin.settings.excludedPaths.join('\n');
         plugin.setStatus('排除规则已保存'); if (plugin.settings.enabled) await plugin.sync(true); this.display();
-      }).finally(() => { if (!plugin.unloaded) b.setDisabled(false); });
+      }).finally((): void => { if (!plugin.unloaded) b.setDisabled(false); });
     }));
     const serverRules = plugin.engine?.state.serverExcludedPaths ?? [];
     if (serverRules.length) containerEl.createEl('p', { text: '后台仓库排除规则：' + serverRules.join('；') });
