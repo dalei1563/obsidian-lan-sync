@@ -42,6 +42,8 @@ Windows Obsidian 1.15.0 的隔离测试 Vault 从 0.3.1 升级到 0.4.0，插件
 - 修复版使用全新空 Vault、新设备邀请、真实 CouchDB、原生文件系统和完整确认回调，从远端下载 251 篇笔记。
 - 下载完成后持续 30 秒检查事件循环与同步状态，均正常响应；251 个文件、零待提交、零冲突。CPU profile 主要为空闲和正常磁盘操作，未出现旧版的 `then` 自解析循环。
 
+[0.4.2 跨平台与真实 CouchDB CI](https://github.com/dalei1563/obsidian-lan-sync/actions/runs/42550829471) 与 [双架构镜像发布](https://github.com/dalei1563/obsidian-lan-sync/actions/runs/42550829540) 均通过。
+
 本次未改变同步协议、文件基线、历史、批量删除审批或存储格式。升级保留已有绑定和本地状态；所有桌面客户端建议使用 0.4.2 或更新版本。
 
 ## 范围与边界

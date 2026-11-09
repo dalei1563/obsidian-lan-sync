@@ -4,6 +4,8 @@
 
 这是一套独立实现，不依赖或派生自 Self-hosted LiveSync。CouchDB 负责持久化，插件和网关使用本项目自己的同步协议。当前是可试用版本，尚未完成 macOS 实机和长期运行验收。
 
+0.4.2 已修复首次同步确认后的界面卡死。已有设备请原地升级，保留原绑定与本地状态；详见[验收记录](docs/ADMIN_TEST_REPORT.md)。
+
 ## 部署和接入
 
 **Rocky Linux / 1Panel 镜像部署**：使用 [GHCR 和 1Panel 指南](docs/ONEPANEL_GHCR.md) 及 `compose.production.yaml`；以下为本地源码构建方式。0.4 新增[管理员后台、多仓库和排除规则](docs/ADMIN_GUIDE.md)，浏览器打开服务地址的 `/admin/` 即可管理。

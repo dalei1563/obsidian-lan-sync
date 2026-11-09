@@ -2,22 +2,22 @@
 
 ## 发布状态
 
-2026-11-08：**两个 0.4.0 镜像已发布**，支持 linux/amd64 和 linux/arm64；新增单密码管理台、多仓库、设备管理和排除规则。源码仓库为 [dalei1563/obsidian-lan-sync](https://github.com/dalei1563/obsidian-lan-sync)。使用说明见[管理台指南](ADMIN_GUIDE.md)。
+2026-11-09：**两个 0.4.2 镜像已发布**，支持 linux/amd64 和 linux/arm64；修复首次同步完成后按钮回调引发的界面卡死，包含单密码管理台、多仓库、设备管理和排除规则。源码仓库为 [dalei1563/obsidian-lan-sync](https://github.com/dalei1563/obsidian-lan-sync)。使用说明见[管理台指南](ADMIN_GUIDE.md)。
 
 ```text
-ghcr.io/dalei1563/obsidian-lan-sync:0.4.0
-ghcr.io/dalei1563/obsidian-lan-sync-couchdb:0.4.0
+ghcr.io/dalei1563/obsidian-lan-sync:0.4.2
+ghcr.io/dalei1563/obsidian-lan-sync-couchdb:0.4.2
 ```
 
-发布记录：[0.4.0 GHCR 构建](https://github.com/dalei1563/obsidian-lan-sync/actions/runs/42486566431)；[Windows、macOS 与真实 CouchDB CI](https://github.com/dalei1563/obsidian-lan-sync/actions/runs/42486788775) 均成功。macOS CI 通过不等同于 macOS Obsidian GUI 实机验收。
+发布记录：[0.4.2 GHCR 构建](https://github.com/dalei1563/obsidian-lan-sync/actions/runs/42550829540)；[Windows、macOS 与真实 CouchDB CI](https://github.com/dalei1563/obsidian-lan-sync/actions/runs/42550829471) 均成功。macOS CI 通过不等同于 macOS Obsidian GUI 实机验收。
 
 ## 镜像和更新约定
 
 主分支修改 package.json 版本号并提交，或发布匹配版本的 Git 标签，可触发 `.github/workflows/publish-images.yml`；也可在 Actions 手动运行。工作流先构建并运行真实 CouchDB 回归测试，然后发布：
 
 ```text
-ghcr.io/dalei1563/obsidian-lan-sync:0.4.0
-ghcr.io/dalei1563/obsidian-lan-sync-couchdb:0.4.0
+ghcr.io/dalei1563/obsidian-lan-sync:0.4.2
+ghcr.io/dalei1563/obsidian-lan-sync-couchdb:0.4.2
 ```
 
 工作流目标平台为 linux/amd64 和 linux/arm64；实际构建成功后才视为已支持。Tag、package.json 与插件 manifest.json 版本必须一致。使用 GitHub Actions 的 GITHUB_TOKEN，权限限定为发布作业的 packages:write；不在仓库或镜像中写入个人 Token。首次发布后检查两个 Package 的可见性，设为 Public 才能让服务器匿名拉取；公开源码仓库不等于镜像自动公开。
@@ -79,7 +79,7 @@ curl -fsSL https://raw.githubusercontent.com/dalei1563/obsidian-lan-sync/main/de
 ```bash
 bash deployment/setup-images.sh \
   --image-prefix ghcr.io/dalei1563/obsidian-lan-sync \
-  --version 0.4.0 \
+  --version 0.4.2 \
   --expose-lan \
   --out /opt/lan-note-sync \
   --prepare-only
@@ -109,7 +109,7 @@ node dist/server/cli.cjs invite --url http://192.168.1.10:27123
 
 ## 后续更新
 
-从旧版升级到 0.4.0 时，在备份后使用原部署目录执行以下命令。这里假定使用 `/data/lan-note-sync/deployment`，请按原来的实际目录调整：
+从旧版升级到 0.4.2 时，在备份后使用原部署目录执行以下命令。这里假定使用 `/data/lan-note-sync/deployment`，请按原来的实际目录调整：
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/dalei1563/obsidian-lan-sync/main/deployment/bootstrap-images.sh | bash -s -- --out /data/lan-note-sync/deployment --upgrade
