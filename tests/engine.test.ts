@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { Remote } from '../src/sync/remote';
-import { client, fixture, MemoryVault, transport } from './helpers';
+import { client, fixture, MemoryVault, revision, transport } from './helpers';
 import { hash, id } from '../shared/protocol';
 
 async function clients(t: Parameters<typeof fixture>[0]) {
@@ -102,6 +102,35 @@ test('mass deletion requires exact approval at both sending and receiving device
   await a.engine.approveDeletes(); await a.engine.sync();
   await b.engine.sync(); assert.equal(b.local.files.size, 10); assert.equal(b.engine.state.deletePlan?.direction, 'remote');
   await b.engine.approveDeletes(); await b.engine.sync(); assert.equal(b.local.files.size, 0); assert.equal(b.local.trash.length, 10);
+});
+test('mass deletion approval is invalidated when another file is deleted', async t => {
+  const {f, a} = await clients(t);
+  for (let n = 0; n < 10; n++) a.local.set(`note${n}.md`, String(n));
+  await a.engine.initialize(); await a.engine.sync();
+  for (let n = 0; n < 5; n++) a.local.files.delete(`note${n}.md`);
+  await a.engine.sync(); assert.equal(a.engine.state.deletePlan?.paths.length, 5);
+  await a.engine.approveDeletes(); a.local.files.delete('note5.md'); await a.engine.sync();
+  assert.equal(a.engine.state.deletePlan?.paths.length, 6);
+  assert.equal(f.store.snapshot(f.first.vaultId).files.filter(file => file.heads[0].deleted).length, 0);
+});
+
+test('a concurrent revision during conflict resolution remains a separate head', async t => {
+  const {f, a, b} = await clients(t);
+  a.local.set('note.md', 'base'); await a.engine.initialize(); await a.engine.sync(); await b.engine.initialize(); await b.engine.sync();
+  const base = f.store.snapshot(f.first.vaultId).files[0].heads[0];
+  a.local.set('note.md', 'A'); b.local.set('note.md', 'B'); await a.engine.sync(); await b.engine.sync();
+  const conflict = f.store.snapshot(f.first.vaultId).files[0]; assert.equal(conflict.heads.length, 2);
+  const put = f.remoteB.put.bind(f.remoteB), other = Buffer.from('third device edit'); let inject = true;
+  f.remoteB.put = async (bytes, sha) => {
+    await put(bytes, sha);
+    if (inject) { inject = false; await f.remoteA.put(other, hash(other)); await f.remoteA.commit(revision(f.first.deviceId, other, {fileId: base.fileId, parents: [base.id], path: base.path})); }
+  };
+  await b.engine.resolve(base.fileId, 'local');
+  const heads = f.store.snapshot(f.first.vaultId).files[0].heads;
+  assert.equal(heads.length, 2); assert.ok(heads.some(head => head.hash === hash(other)));
+  assert.equal((await f.remoteA.get(hash(other))).toString(), 'third device edit');
+  assert.ok(f.store.history(f.first.vaultId, base.fileId).some(item => item.revision.hash === hash(Buffer.from('A'))));
+  assert.ok(f.store.history(f.first.vaultId, base.fileId).some(item => item.revision.hash === hash(Buffer.from('B'))));
 });
 test('crash after writing local content recovers from the applying journal without echo', async t => {
   const { f, a, b } = await clients(t);
