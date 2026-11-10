@@ -103,6 +103,19 @@ for (const kind of ['sqlite', 'couchdb'] as const) {
     await submit(f.store, a.id, pair.deviceId, 'resumed', { fileId: committed.revision.fileId, parents: [committed.revision.id], path: 'private/note.md' });
     assert.equal((await f.store.activity(a.id)).items.length, 2);
   });
+  test(`${kind} management: removing a vault hides it and denies devices while retaining history`, options, async t => {
+    const f = await managementFixture(t, kind), a = await f.store.createVault('Test to remove'), b = await f.store.createVault('Keep');
+    const pair = await f.store.pair((await f.store.createPair(a.name, a.id)).code, 'Device');
+    const unused = await f.store.createPair(a.name, a.id), saved = await submit(f.store, a.id, pair.deviceId, 'retained');
+    await f.store.archiveVault(a.id);
+    assert.deepEqual((await f.store.listVaults()).map(v => v.id), [b.id]);
+    await assert.rejects(async () => f.store.authenticate(pair.token), errorCode('unauthorized'));
+    await assert.rejects(async () => f.store.pair(unused.code, 'Another'));
+    assert.equal((await f.store.activity()).items.length, 0); assert.equal((await f.store.devices()).length, 0);
+    assert.equal((await f.store.history(a.id, saved.revision.fileId)).length, 1);
+    await f.reopen(); assert.deepEqual((await f.store.listVaults()).map(v => v.id), [b.id]);
+    assert.equal((await f.store.history(a.id, saved.revision.fileId)).length, 1);
+  });
 }
 
 test('SQLite management migration preserves existing unknown dates and original Vault IDs', async t => {

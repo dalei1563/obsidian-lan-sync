@@ -51,10 +51,11 @@ export function makeServer(store: Backend, tls?: ServerOptions, distribution?: D
       }
       const auth = await store.authenticate((req.headers.authorization ?? '').replace(/^Bearer /, ''));
       admin.observeDevice(auth.deviceId);
-      const match = /^\/v1\/vaults\/([a-zA-Z0-9_-]+)\/(state|changes|commits|objects|history|check)(?:\/([a-zA-Z0-9_-]+))?$/.exec(url.pathname);
+      const match = /^\/v1\/vaults\/([a-zA-Z0-9_-]+)\/(state|changes|commits|reconcile|objects|history|check)(?:\/([a-zA-Z0-9_-]+))?$/.exec(url.pathname);
       if (!match) throw new SyncError('not_found', '接口不存在', 404);
       const [, vaultId, action, target] = match; assertId(vaultId);
       if (vaultId !== auth.vaultId) throw new SyncError('forbidden', '设备无权访问此 Vault', 403);
+      if (admin.isRestoring(vaultId)) throw new SyncError('restore_busy', '管理员正在恢复仓库，同步将稍后重试', 503);
       if (req.method === 'GET' && action === 'state' && !target) return json(res, 200, await store.snapshot(vaultId));
       if (req.method === 'GET' && action === 'changes' && !target) {
         return json(res, 200, await store.changes(vaultId, url.searchParams.get('after') ?? 0, url.searchParams.get('epoch') ?? ''));
@@ -68,6 +69,12 @@ export function makeServer(store: Backend, tls?: ServerOptions, distribution?: D
         }
       }
       if (req.method === 'POST' && action === 'commits' && !target) return json(res, 201, await store.commit(vaultId, await readJson(req), auth.deviceId));
+      if (req.method === 'POST' && action === 'reconcile' && !target) {
+        const value = await readJson(req), heads = value?.expectedHeads;
+        if (!Array.isArray(heads) || heads.length > 32 || new Set(heads).size !== heads.length) throw new SyncError('invalid_heads', '覆盖计划无效，请重新预览', 400);
+        heads.forEach(assertId);
+        return json(res, 201, await store.commit(vaultId, value.revision, auth.deviceId, heads));
+      }
       if (req.method === 'POST' && action === 'check' && !target) return json(res, 200, { known: await store.known(vaultId, (await readJson(req))?.revisions) });
       if (req.method === 'GET' && action === 'history' && target) {
         const before = url.searchParams.get('before') ?? undefined;

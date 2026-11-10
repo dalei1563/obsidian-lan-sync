@@ -37,7 +37,7 @@ test('Windows installer discovers one registered Vault without requiring a path 
 const posix = (p: string) => p.replace(/\\/g, '/').replace(/^([A-Za-z]):/, (_, drive) => '/' + drive.toLowerCase());
 for (const platform of ['powershell', 'bash'] as const) {
   const bash = process.env.TEST_BASH ?? (process.platform === 'win32' ? 'D:/program/Git/bin/bash.exe' : '/bin/bash');
-  test(`${platform} installer preserves notes and other plugins, pre-fills enrollment, and refuses an implicit reinstall`, { skip: platform === 'powershell' ? process.platform !== 'win32' : !existsSync(bash) }, async t => {
+  test(`${platform} installer preserves notes and existing connection during install and update`, { skip: platform === 'powershell' ? process.platform !== 'win32' : !existsSync(bash) }, async t => {
     const root = temp(t), distribution = assets(root), f = await fixture(t, distribution);
     const vault = join(root, 'Vault with spaces 中文'); mkdirSync(join(vault, '.obsidian', 'plugins', 'other'), { recursive: true });
     writeFileSync(join(vault, '笔记.md'), 'unchanged'); writeFileSync(join(vault, '.obsidian', 'community-plugins.json'), '["other"]');
@@ -50,7 +50,18 @@ for (const platform of ['powershell', 'bash'] as const) {
     assert.equal(bootstrap.connection, connection); assert.equal(readFileSync(join(vault, '笔记.md'), 'utf8'), 'unchanged');
     assert.equal(readFileSync(join(vault, '.obsidian', 'community-plugins.json'), 'utf8'), '["other"]');
     assert.equal(readFileSync(join(plugin, 'main.js'), 'utf8'), 'module.exports = {};\n');
-    const again = await command(executable, args); assert.notEqual(again.code, 0);
+    const renewed = encodeConnection(f.url, 'd'.repeat(24));
+    const refreshed = await command(executable, args.map(arg => arg === connection ? renewed : arg));
+    if (refreshed.code !== 0) assert.match(refreshed.output, /Close Obsidian before upgrading/);
+    else assert.equal(JSON.parse(readFileSync(join(plugin, 'bootstrap.json'), 'utf8').replace(/^\ufeff/, '')).connection, renewed);
+    writeFileSync(join(plugin, 'data.json'), JSON.stringify({ vaultId: 'existing-vault', secretId: 'existing-secret' }));
+    const again = await command(executable, args);
+    if (again.code !== 0) assert.match(again.output, /Close Obsidian before upgrading/);
+    else {
+      assert.deepEqual(JSON.parse(readFileSync(join(plugin, 'data.json'), 'utf8')), { vaultId: 'existing-vault', secretId: 'existing-secret' });
+      assert.equal(JSON.parse(readFileSync(join(plugin, 'bootstrap.json'), 'utf8').replace(/^\ufeff/, '')).connection, refreshed.code === 0 ? renewed : connection);
+    }
+    assert.equal(readFileSync(join(vault, '笔记.md'), 'utf8'), 'unchanged');
   });
   test(`${platform} installer rejects a damaged download before replacing an existing installation`, { skip: platform === 'powershell' ? process.platform !== 'win32' : !existsSync(bash) }, async t => {
     const root = temp(t), distribution = assets(root), normal = distribution.serve.bind(distribution);

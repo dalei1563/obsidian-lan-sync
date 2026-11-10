@@ -2,6 +2,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import type { ServerResponse } from 'node:http';
 import { hash } from '../shared/protocol';
+import { pluginZip } from './zip';
 
 /** Explicit allowlist: plugin state, server config and credentials are never served. */
 export class Distribution {
@@ -18,6 +19,7 @@ export class Distribution {
       this.manifest.files.push({ name, sha256: hash(body), size: body.length });
       this.assets.set('/install/files/' + name, { body, type: 'application/octet-stream' });
     }
+    this.assets.set('/install/plugin.zip', {body: pluginZip(names.map(name => ({name, body: this.assets.get('/install/files/' + name)!.body}))), type: 'application/zip'});
     for (const [route, file, type] of [['/install.ps1', 'install.ps1', 'text/plain; charset=utf-8'], ['/install.sh', 'install.sh', 'text/plain; charset=utf-8']] as const) {
       this.assets.set(route, { body: readFileSync(join(folder, file)), type });
     }

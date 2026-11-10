@@ -55,6 +55,7 @@ export class ObsidianVault implements LocalVault {
       throw new Error(`笔记正在编辑器中打开，请关闭后同步：${path}`);
     }
   }
+  assertClosed(paths: string[]): void { for (const path of paths) this.ensureClosed(path); }
   private async folders(path: string): Promise<void> {
     const parts = path.split('/'); parts.pop(); let current = '';
     for (const part of parts) {

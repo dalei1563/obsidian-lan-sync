@@ -15,6 +15,8 @@ interface Overview {
   totals: { vaults: number; files: number; conflicts: number; devices: number; bytes: number; revisions: number };
 }
 interface Invitation { vaultId: string; expires: number; connection: string; windowsCommand: string; macCommand: string }
+interface FileHistory { items: {seq: string | number; createdAt?: number | null; revision: {id: string; path: string; deleted: boolean; size: number}}[]; heads: string[]; nextCursor: string | number | null }
+interface RestorePlan { point: string; fingerprint: string; actions: {fileId: string; before: {path: string; deleted: boolean}; target: {path: string; deleted: boolean} | null; predelete: boolean}[] }
 type View = 'overview' | 'vaults' | 'activity' | 'devices' | 'settings';
 type IconName = 'grid' | 'folder' | 'activity' | 'devices' | 'settings' | 'arrow' | 'plus' | 'refresh' | 'copy' | 'logout' | 'close' | 'search' | 'server' | 'file' | 'check' | 'alert' | 'clock' | 'shield';
 const paths: Record<IconName, string> = {
@@ -340,10 +342,123 @@ class Manager {
     const info = this.card('仓库信息'), infoBody = el('div', 'card-body');
     const stats = el('div', 'detail-stats'); for (const [value, text] of [[count(vault.files), '当前文件'], [count(vault.devices), '已授权设备'], [count(vault.conflicts), '并发冲突']] as [string, string][]) append(stats, append(el('div', 'detail-stat'), el('strong', '', value), el('span', '', text)));
     append(infoBody, stats, this.infoList([['正文占用', size(vault.bytes)], ['累计业务版本', count(vault.revisionCount)], ['已删除文件身份', count(vault.deletedFiles)], ['创建时间', date(vault.createdAt, true)]]));
-    const copyId = button('复制完整仓库 ID', () => void this.run(() => copy(vault.id)), 'small', 'copy'); infoBody.append(el('div', 'divider'), copyId);
+    const copyId = button('复制完整仓库 ID', () => void this.run(() => copy(vault.id)), 'small', 'copy');
+    infoBody.append(el('div', 'divider'), copyId, button('移除仓库', () => this.archiveVaultDialog(vault), 'small'));
     info.body.append(infoBody); append(cols, policy.card, info.card); this.content!.append(cols);
+    const listing = this.card('仓库文件', '当前已同步的 Markdown 文件', button('恢复整个仓库', () => void this.vaultHistory(vault.id), 'subtle', 'clock'));
+    const listBody = el('div', 'card-body'); listBody.append(el('p', 'muted', '正在读取文件…')); listing.body.append(listBody); this.content!.append(listing.card);
+    void this.api<{files: {fileId: string; paths: string[]; size: number; conflicts: boolean; deleted: boolean}[]}>('/vaults/' + encodeURIComponent(vault.id) + '/files').then(result => {
+      if (!listBody.isConnected) return;
+      if (!result.files.length) { listBody.replaceChildren(el('p', 'muted', '这个仓库还没有同步文件。')); return; }
+      const {wrap, body} = this.table(['文件路径', '正文大小', '状态']);
+      for (const file of result.files) {
+        const row = el('tr'), nameCell = el('td');
+        nameCell.append(button(file.paths.join(' / '), () => void (file.deleted ? this.fileHistory(vault.id, file.fileId) : this.filePreview(vault.id, file.fileId)), 'link'));
+        append(row, nameCell, el('td', '', size(file.size)), el('td', '', file.conflicts ? '有冲突' : file.deleted ? '已删除' : '正常')); body.append(row);
+      }
+      listBody.replaceChildren(wrap);
+    }).catch(error => { if (listBody.isConnected) listBody.replaceChildren(el('p', 'muted', error instanceof Error ? error.message : '读取失败')); });
     const linked = this.card('连接到这个仓库的设备', '每台设备使用自己的连接码和凭证', button('查看设备管理', () => { this.deviceFilter = vault.id; this.navigate('devices'); }, 'link'));
     linked.body.append(this.deviceTable(this.overview!.devices.filter(d => d.vault_id === vault.id))); this.content!.append(linked.card);
+  }
+
+  private archiveVaultDialog(vault: VaultSummary) {
+    const modal = this.openDialog('移除仓库', '该仓库会从管理页面移除，关联设备将无法同步。服务端保留数据和历史，误操作后需要管理员协助恢复。', true);
+    const input = el('input', 'input'); input.setAttribute('aria-label', '输入仓库名称'); input.placeholder = vault.name;
+    modal.body.append(el('p', '', `输入仓库名称“${vault.name}”确认移除。`), input);
+    const confirm = button('确认移除', () => void this.run(async () => {
+      if (input.value !== vault.name) throw new Error('请输入完整仓库名称');
+      await this.api('/vaults/' + encodeURIComponent(vault.id) + '/archive', 'POST', {name: input.value});
+      modal.dialog.close(); this.selectedVault = ''; await this.loadOverview(); this.navigate('vaults'); toast('仓库已移除，原数据保留在服务端');
+    }, confirm), 'primary');
+    modal.actions.append(button('取消', () => modal.dialog.close()), confirm);
+  }
+
+  private async vaultHistory(vaultId: string) {
+    const modal = this.openDialog('恢复整个仓库', '选择一次变更，预览当时仓库的状态。恢复会生成新版本，保留此后的历史。', true);
+    const rows = el('div'); modal.body.append(rows); let next: string | null = null;
+    const more = button('加载更早记录', () => void this.run(() => load(true), more));
+    const load = async (appendPage = false) => {
+      const params = new URLSearchParams({vaultId, limit: '50'}); if (appendPage && next) params.set('before', next);
+      const page = await this.api<ActivityPage>('/activity?' + params); if (!modal.dialog.open) return;
+      if (!appendPage) rows.replaceChildren(); next = page.nextCursor;
+      for (const item of page.items) {
+        const point = item.id.slice(vaultId.length + 1), line = el('div', 'save-row');
+        const labels = {create: '创建', update: '更新', rename: '重命名', delete: '删除', resolve: '解决冲突'};
+        append(line, el('span', '', `${date(item.createdAt, true)} · ${item.path} · ${labels[item.action]}`),
+          button('预览此时间点', () => void this.vaultRestorePreview(vaultId, point), 'small')); rows.append(line);
+      }
+      if (!page.items.length && !appendPage) rows.append(el('p', 'muted', '还没有可恢复的版本。'));
+      more.hidden = next === null;
+    };
+    modal.actions.append(button('关闭', () => modal.dialog.close()), more);
+    try { await load(); } catch (error) { if (modal.dialog.open) rows.replaceChildren(el('p', '', error instanceof Error ? error.message : '读取失败')); }
+  }
+
+  private async vaultRestorePreview(vaultId: string, point: string) {
+    const modal = this.openDialog('整库恢复预览', '恢复只在后台进行，客户端将同步恢复后的新版本。', true);
+    modal.body.append(el('p', 'muted', '正在比较…'));
+    try {
+      const plan = await this.api<RestorePlan>('/vaults/' + encodeURIComponent(vaultId) + '/restore?point=' + encodeURIComponent(point));
+      if (!modal.dialog.open) return;
+      const lines = plan.actions.map(a => !a.target || a.target.deleted ? `删除：${a.before.path}` : a.before.deleted ? `恢复：${a.target.path}` : a.before.path !== a.target.path ? `恢复：${a.before.path} → ${a.target.path}` : `恢复旧内容：${a.target.path}`);
+      modal.body.replaceChildren(el('p', '', `将更改 ${lines.length} 个文件；排除同步的文件不参与。`), el('pre', 'code-block', lines.join('\n') || '仓库已与所选时间点一致。'),
+        el('p', 'muted', '恢复期间设备会暂时重试同步。如果中途暂停，重新选择同一时间点并预览即可继续。请留意其他设备尚未上传的修改。'));
+      const confirm = button('确认恢复整个仓库', () => void this.run(async () => {
+        await this.api('/vaults/' + encodeURIComponent(vaultId) + '/restore', 'POST', {point, fingerprint: plan.fingerprint});
+        modal.dialog.close(); await this.loadOverview(); toast('整库恢复完成，历史版本已保留');
+      }, confirm), 'primary');
+      modal.actions.append(button('取消', () => modal.dialog.close()), confirm);
+    } catch (error) { if (modal.dialog.open) { modal.body.replaceChildren(el('p', '', error instanceof Error ? error.message : '读取失败')); modal.actions.append(button('关闭', () => modal.dialog.close())); } }
+  }
+
+  private async filePreview(vaultId: string, fileId: string) {
+    const modal = this.openDialog('文件预览', '只读查看服务器上的 Markdown 内容', true);
+    modal.body.append(el('p', 'muted', '正在读取…'));
+    try {
+      const file = await this.api<{path: string; content: string}>('/vaults/' + encodeURIComponent(vaultId) + '/files/' + encodeURIComponent(fileId));
+      if (!modal.dialog.open) return;
+      modal.body.replaceChildren(el('h3', '', file.path), el('pre', 'code-block', file.content));
+    } catch (error) {
+      if (modal.dialog.open) modal.body.replaceChildren(el('p', '', error instanceof Error ? error.message : '读取失败'));
+    }
+    if (modal.dialog.open) modal.actions.append(button('关闭', () => modal.dialog.close()), button('历史版本', () => void this.fileHistory(vaultId, fileId), 'primary'));
+  }
+
+  private async fileHistory(vaultId: string, fileId: string) {
+    const modal = this.openDialog('历史版本', '选择一个旧版本查看；恢复会创建新版本，保留已有历史。', true);
+    const rows = el('div'); modal.body.append(rows); let next: string | number | null = null; let heads: string[] = [];
+    const more = button('加载更早版本', () => void this.run(() => load(true), more));
+    const load = async (appendPage = false) => {
+      const query = appendPage && next !== null ? '?before=' + encodeURIComponent(String(next)) : '';
+      const page = await this.api<FileHistory>('/vaults/' + encodeURIComponent(vaultId) + '/files/' + encodeURIComponent(fileId) + '/history' + query);
+      if (!modal.dialog.open) return; if (!appendPage) rows.replaceChildren(); heads = page.heads; next = page.nextCursor;
+      for (const item of page.items) {
+        const line = el('div', 'save-row');
+        append(line, el('span', '', `${date(item.createdAt, true)} · ${item.revision.deleted ? '删除版本' : size(item.revision.size)} · ${item.revision.id.slice(0, 8)}`),
+          button('查看', () => void this.historicalPreview(vaultId, fileId, item.revision.id, heads), 'small'));
+        rows.append(line);
+      }
+      if (!page.items.length && !appendPage) rows.append(el('p', 'muted', '没有历史版本。'));
+      more.hidden = next === null;
+    };
+    modal.actions.append(button('关闭', () => modal.dialog.close()), more);
+    try { await load(); } catch (error) { if (modal.dialog.open) rows.replaceChildren(el('p', '', error instanceof Error ? error.message : '读取失败')); }
+  }
+
+  private async historicalPreview(vaultId: string, fileId: string, revisionId: string, heads: string[]) {
+    const modal = this.openDialog('查看旧版本', '恢复会生成新版本，现有版本和历史都会保留。', true);
+    modal.body.append(el('p', 'muted', '正在读取…'));
+    try {
+      const value = await this.api<{revision: {path: string; deleted: boolean}; content: string | null}>('/vaults/' + encodeURIComponent(vaultId) + '/files/' + encodeURIComponent(fileId) + '/history?revisionId=' + encodeURIComponent(revisionId));
+      if (!modal.dialog.open) return;
+      modal.body.replaceChildren(el('h3', '', value.revision.path), el('pre', 'code-block', value.revision.deleted ? '这是一个删除版本。恢复后，该文件将被删除。' : value.content ?? ''));
+      const confirm = button('确认恢复为新版本', () => void this.run(async () => {
+        await this.api('/vaults/' + encodeURIComponent(vaultId) + '/files/' + encodeURIComponent(fileId) + '/restore', 'POST', { revisionId, expectedHeads: heads });
+        modal.dialog.close(); await this.loadOverview(); toast('已创建恢复版本，设备将在下次同步时接收');
+      }, confirm), 'primary');
+      modal.actions.append(button('取消', () => modal.dialog.close()), confirm);
+    } catch (error) { if (modal.dialog.open) { modal.body.replaceChildren(el('p', '', error instanceof Error ? error.message : '读取失败')); modal.actions.append(button('关闭', () => modal.dialog.close())); } }
   }
 
   private vaultFilter(value: string, onChange: (value: string) => void, label: string): HTMLSelectElement {
@@ -468,8 +583,11 @@ class Manager {
       for (const [key, label] of choices) { const b = el('button', 'invite-tab', label); b.type = 'button'; b.dataset.tab = key; b.addEventListener('click', () => { current = key; update(); }); tabs.append(b); }
       const copyButton = button('复制', () => void this.run(() => copy(value()), copyButton), 'primary small', 'copy');
       const expiry = el('span', '', `有效期至 ${date(invitation.expires, true)}`), steps = el('ol', 'steps');
-      for (const text of ['在 Obsidian 中创建或打开目标笔记库。', '运行命令并选择该笔记库；在第三方插件中启用 LAN Note Sync。', '查看首次同步预览，再确认开始。每个本地笔记库分别连接。']) steps.append(el('li', '', text));
+      for (const text of ['在 Obsidian 中创建或打开目标笔记库。', '首次安装或更新都运行这条命令；更新前请退出 Obsidian，并选择原来的笔记库。', '已连接的笔记库会保留原连接；新接入时在第三方插件中启用 LAN Note Sync，查看首次同步预览。']) steps.append(el('li', '', text));
       modal.body.replaceChildren(tabs, hint, code, append(el('div', 'invite-info'), expiry, copyButton), steps);
+      const download = el('a', 'button small', '下载插件 ZIP（手动安装）'); download.href = '/install/plugin.zip'; download.download = 'lan-note-sync.zip';
+      const manual = el('p', 'section-note', '也可以下载 ZIP，解压到目标笔记库的 .obsidian/plugins/ 目录，在 Obsidian 启用插件，然后在“连接码”页复制并粘贴连接码。');
+      modal.body.append(download, manual);
       const note = el('div', 'notice'); append(note, icon('clock'), el('span', '', '连接信息 10 分钟有效，限首次认领设备使用。新设备请重新生成，长期设备凭证不会显示在这里。')); modal.body.append(el('div', 'divider'), note);
       append(modal.actions, button('关闭', () => modal.dialog.close()), button('为另一台设备生成', () => void this.inviteDialog(vault), '', 'refresh')); update();
     } catch (e) {

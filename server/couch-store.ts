@@ -109,7 +109,7 @@ export class CouchStore implements Backend {
   }
   private async vault(vaultId: string): Promise<Doc> {
     assertId(vaultId); const vault = await this.doc('vault:' + vaultId);
-    if (!vault || vault.type !== 'vault') throw new SyncError('vault_missing', '仓库不存在', 404);
+    if (!vault || vault.type !== 'vault' || vault.archived) throw new SyncError('vault_missing', '仓库不存在', 404);
     return vault;
   }
   private async exclusions(vaultId: string): Promise<string[]> { return normalizeExclusions((await this.vault(vaultId)).excludedPaths ?? []); }
@@ -119,6 +119,9 @@ export class CouchStore implements Backend {
       await this.put({ _id: 'vault:' + result.id, type: 'vault', vaultId: result.id, name: result.name, createdAt: Date.now(), excludedPaths: [] });
       return result;
     });
+  }
+  archiveVault(vaultId: string): Promise<void> {
+    return this.serial(async () => { const vault = await this.vault(vaultId); await this.put({...vault, archived: true}); });
   }
   renameVault(vaultId: string, name: string): Promise<void> {
     return this.serial(async () => { const vault = await this.vault(vaultId); await this.put({ ...vault, name: managementName(name) }); });
@@ -132,7 +135,7 @@ export class CouchStore implements Backend {
       const revisionCounts = new Map<string, number>(), deviceCounts = new Map<string, number>();
       for (const { doc } of this.records.values()) revisionCounts.set(doc.vaultId, (revisionCounts.get(doc.vaultId) ?? 0) + 1);
       for (const device of devices) if (!device.revoked) deviceCounts.set(device.vaultId, (deviceCounts.get(device.vaultId) ?? 0) + 1);
-      return vaults.map(vault => {
+      return vaults.filter(vault => !vault.archived).map(vault => {
         const files = [...(this.files.get(vault.vaultId)?.keys() ?? [])].map(fileId => this.file(vault.vaultId, fileId));
         return { id: vault.vaultId, name: vault.name, createdAt: typeof vault.createdAt === 'number' ? vault.createdAt : null, ...summarizeFiles(files),
           revisionCount: revisionCounts.get(vault.vaultId) ?? 0,
@@ -144,9 +147,9 @@ export class CouchStore implements Backend {
   activity(vaultId?: string, before?: string, limit = 50): Promise<ActivityPage> {
     return this.serial(async () => {
       activityLimit(limit); if (vaultId !== undefined) await this.vault(vaultId);
-      await this.refresh(); const vaults = new Map((await this.prefix('vault:')).map(v => [v.vaultId, v.name]));
+      await this.refresh(); const vaults = new Map((await this.prefix('vault:')).filter(v => !v.archived).map(v => [v.vaultId, v.name]));
       const devices = new Map((await this.prefix('device:')).map(d => [d.id, d.name]));
-      const list = [...this.records.values()].filter(row => vaultId === undefined || row.doc.vaultId === vaultId).reverse();
+      const list = [...this.records.values()].filter(row => vaults.has(row.doc.vaultId) && (vaultId === undefined || row.doc.vaultId === vaultId)).reverse();
       let start = 0;
       if (before !== undefined) {
         const [vid, rid] = parseActivityCursor(before);
@@ -158,7 +161,7 @@ export class CouchStore implements Backend {
         const r = doc.revision;
         return { id: activityId(doc.vaultId, r.id), vaultId: doc.vaultId, vaultName: vaults.get(doc.vaultId) ?? '未知仓库', fileId: r.fileId, path: r.path,
           action: revisionAction(r, parent => this.records.get(this.key(doc.vaultId, 'revision', parent))?.doc.revision),
-          deviceId: r.clientId, deviceName: devices.get(r.clientId) ?? '未知设备', bytes: r.size, createdAt: typeof doc.createdAt === 'number' ? doc.createdAt : null };
+          deviceId: r.clientId, deviceName: r.clientId === 'admin-restore' ? '管理员' : devices.get(r.clientId) ?? '未知设备', bytes: r.size, createdAt: typeof doc.createdAt === 'number' ? doc.createdAt : null };
       });
       return { items, nextCursor: list.length > start + limit ? items[items.length - 1].id : null };
     });
@@ -172,6 +175,7 @@ export class CouchStore implements Backend {
         if (vaultId) throw new Error('指定的远端笔记库不存在，请检查 Vault ID');
         await this.put({ _id: vaultKey, type: 'vault', name, vaultId: vid, createdAt: Date.now(), excludedPaths: [] });
       }
+      await this.vault(vid);
       const code = randomBytes(12).toString('hex'), expires = Date.now() + 10 * 60 * 1000;
       await this.put({ _id: 'pair:' + hash(code), type: 'pair', vaultId: vid, deviceId: id(), expires });
       return { code, vaultId: vid, expires };
@@ -183,6 +187,7 @@ export class CouchStore implements Backend {
       assertId(requestId);
       let pairing = await this.doc('pair:' + hash(code));
       if (!pairing || pairing.expires <= Date.now() || (pairing.requestId && pairing.requestId !== requestId)) throw new SyncError('pair_denied', '连接码已过期、无效或已被其他设备使用，请在原仓库为这台设备重新生成连接码', 401);
+      await this.vault(pairing.vaultId);
       if (!pairing.requestId) {
         pairing = { ...pairing, requestId, deviceName: name };
         try { await this.put(pairing); }
@@ -205,6 +210,7 @@ export class CouchStore implements Backend {
     if (!/^[a-f0-9]{64}$/.test(token)) throw new SyncError('unauthorized', '设备未授权或已撤销', 401);
     const device = await this.doc('device:' + hash(token));
     if (!device || device.type !== 'device' || device.revoked) throw new SyncError('unauthorized', '设备未授权或已撤销', 401);
+    try { await this.vault(device.vaultId); } catch (error) { if (error instanceof SyncError && error.code === 'vault_missing') throw new SyncError('unauthorized', '设备未授权或已撤销', 401); throw error; }
     return { vaultId: device.vaultId, deviceId: device.id };
   }
   async putObject(vaultId: string, sha: string, data: Buffer): Promise<void> {
@@ -240,7 +246,7 @@ export class CouchStore implements Backend {
       return { serverId: this.serverId, epoch: this.epoch, cursor: page.last_seq, more: page.pending > 0, changes, excludedPaths: await this.exclusions(vaultId) };
     });
   }
-  commit(vaultId: string, input: unknown, deviceId: string): Promise<CommitResult> {
+  commit(vaultId: string, input: unknown, deviceId: string, expectedHeads?: string[]): Promise<CommitResult> {
     return this.serial(async () => {
       const revision = validateRevision(input); assertId(vaultId);
       if (revision.clientId !== deviceId) throw new SyncError('wrong_device', '修订必须属于当前设备', 403);
@@ -248,6 +254,7 @@ export class CouchStore implements Backend {
       if (previous) { if (JSON.stringify(previous.doc.revision) !== JSON.stringify(revision)) throw new SyncError('idempotency_conflict', '修订标识被用于不同内容'); return { revision, file: previous.doc.fileAfter, seq: previous.seq }; }
       if (isExcluded(revision.path, await this.exclusions(vaultId))) throw new SyncError('path_excluded', '该路径已被仓库排除规则暂停同步', 409);
       const existing = this.file(vaultId, revision.fileId);
+      if (expectedHeads && JSON.stringify(existing.heads.map(h => h.id).sort()) !== JSON.stringify([...expectedHeads].sort())) throw new SyncError('heads_changed', '文件已发生变化，请重新查看后再操作', 409);
       if (existing.heads.length && !revision.parents.length) throw new SyncError('missing_parent', '已有文件不能创建第二个无父版本');
       if (!existing.heads.length && (this.files.get(vaultId)?.size ?? 0) >= MAX_FILES) throw new SyncError('vault_too_large', '文件数量达到首版上限', 413);
       for (const parent of revision.parents) if (this.records.get(this.key(vaultId, 'revision', parent))?.doc.revision.fileId !== revision.fileId) throw new SyncError('unknown_parent', '父修订不存在或不属于此文件');
@@ -273,12 +280,25 @@ export class CouchStore implements Backend {
     return this.serial(async () => { if (!Array.isArray(ids) || ids.length > 100) throw new SyncError('invalid_check', '每次最多核对 100 个版本', 400);
       ids.forEach(assertId); await this.refresh(); return ids.filter(value => this.records.has(this.key(vaultId, 'revision', value))); });
   }
-  history(vaultId: string, fileId: string, before?: Cursor): Promise<{ seq: Cursor; revision: Revision }[]> {
+  history(vaultId: string, fileId: string, before?: Cursor): Promise<{ seq: Cursor; revision: Revision; createdAt: number | null }[]> {
     return this.serial(async () => { assertId(fileId); await this.refresh();
       const list = [...this.records.values()].filter(r => r.doc.vaultId === vaultId && r.doc.revision.fileId === fileId).reverse();
       const start = before === undefined ? 0 : list.findIndex(r => String(r.seq) === String(before)) + 1;
       if (before !== undefined && start === 0) throw new SyncError('invalid_cursor', '历史游标已失效，请重新打开历史记录', 400);
-      return list.slice(start, start + 100).map(r => ({ seq: r.seq, revision: r.doc.revision })); });
+      return list.slice(start, start + 100).map(r => ({ seq: r.seq, revision: r.doc.revision, createdAt: typeof r.doc.createdAt === 'number' ? r.doc.createdAt : null })); });
+  }
+  historyPoint(vaultId: string, revisionId: string): Promise<FileState[]> {
+    return this.serial(async () => {
+      assertId(vaultId); assertId(revisionId); await this.vault(vaultId); await this.refresh();
+      const files = new Map<string, FileState>(); let found = false;
+      for (const {doc} of this.records.values()) {
+        if (doc.vaultId !== vaultId) continue;
+        files.set(doc.revision.fileId, doc.fileAfter);
+        if (doc.revision.id === revisionId) { found = true; break; }
+      }
+      if (!found) throw new SyncError('revision_missing', '仓库历史版本不存在', 404);
+      return [...files.values()].sort((a, b) => a.fileId.localeCompare(b.fileId));
+    });
   }
   private async prefix(prefix: string): Promise<Doc[]> {
     const result: Doc[] = []; let after: string | undefined;
@@ -288,7 +308,7 @@ export class CouchStore implements Backend {
       result.push(...page.rows.map((r: any) => r.doc)); if (page.rows.length < 100) return result; after = page.rows[page.rows.length - 1].id;
     }
   }
-  async devices(): Promise<DeviceInfo[]> { return (await this.prefix('device:')).map(d => ({ id: d.id, vault_id: d.vaultId, name: d.name, revoked: d.revoked ? 1 : 0 })); }
+  async devices(): Promise<DeviceInfo[]> { const active = new Set((await this.prefix('vault:')).filter(v => !v.archived).map(v => v.vaultId)); return (await this.prefix('device:')).filter(d => active.has(d.vaultId)).map(d => ({ id: d.id, vault_id: d.vaultId, name: d.name, revoked: d.revoked ? 1 : 0 })); }
   async revoke(deviceId: string): Promise<void> { assertId(deviceId); const device = (await this.prefix('device:')).find(d => d.id === deviceId); if (!device) throw new Error('Device not found'); await this.put({ ...device, revoked: true }); }
   async health(): Promise<void> { await this.raw(''); }
   async backup(destination: string): Promise<void> {

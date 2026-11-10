@@ -35,6 +35,7 @@ export class Store implements Backend {
     const vaultColumns = new Set((this.db.prepare('PRAGMA table_info(vaults)').all() as Row[]).map(r => r.name));
     if (!vaultColumns.has('created_at')) this.db.exec('ALTER TABLE vaults ADD COLUMN created_at INTEGER');
     if (!vaultColumns.has('excluded_paths')) this.db.exec("ALTER TABLE vaults ADD COLUMN excluded_paths TEXT NOT NULL DEFAULT '[]'");
+    if (!vaultColumns.has('archived')) this.db.exec('ALTER TABLE vaults ADD COLUMN archived INTEGER NOT NULL DEFAULT 0');
     const revisionColumns = new Set((this.db.prepare('PRAGMA table_info(revisions)').all() as Row[]).map(r => r.name));
     if (!revisionColumns.has('created_at')) this.db.exec('ALTER TABLE revisions ADD COLUMN created_at INTEGER');
     const version = this.db.prepare("SELECT value FROM meta WHERE key='schema'").get() as Row | undefined;
@@ -58,6 +59,7 @@ export class Store implements Backend {
     const expires = Date.now() + 10 * 60 * 1000;
     this.transaction(() => {
       this.db.prepare('INSERT OR IGNORE INTO vaults(id,name,created_at) VALUES (?,?,?)').run(vid, vaultName, Date.now());
+      this.vault(vid);
       this.db.prepare('DELETE FROM pairing WHERE expires < ?').run(Date.now());
       this.db.prepare('INSERT INTO pairing VALUES (?,?,?)').run(hash(code), vid, expires);
     });
@@ -66,7 +68,7 @@ export class Store implements Backend {
   pair(code: string, deviceName: string): PairResult {
     if (!/^[a-f0-9]{24}$/.test(code) || !deviceName.trim() || deviceName.length > 100) throw new SyncError('pair_denied', '连接码已过期、无效或已被其他设备使用，请在原仓库为这台设备重新生成连接码', 401);
     return this.transaction(() => {
-      const row = this.db.prepare('SELECT p.vault_id,v.name FROM pairing p JOIN vaults v ON v.id=p.vault_id WHERE code_hash=? AND expires>?').get(hash(code), Date.now()) as Row | undefined;
+      const row = this.db.prepare('SELECT p.vault_id,v.name FROM pairing p JOIN vaults v ON v.id=p.vault_id WHERE code_hash=? AND expires>? AND v.archived=0').get(hash(code), Date.now()) as Row | undefined;
       if (!row) throw new SyncError('pair_denied', '连接码已过期、无效或已被其他设备使用，请在原仓库为这台设备重新生成连接码', 401);
       const token = randomBytes(32).toString('hex'), deviceId = id();
       this.db.prepare('INSERT INTO devices(id,vault_id,name,token_hash) VALUES (?,?,?,?)').run(deviceId, row.vault_id, deviceName, hash(token));
@@ -76,7 +78,7 @@ export class Store implements Backend {
   }
   authenticate(token: string): { vaultId: string; deviceId: string } {
     if (!/^[a-f0-9]{64}$/.test(token)) throw new SyncError('unauthorized', '设备未授权或已撤销', 401);
-    const row = this.db.prepare('SELECT id,vault_id FROM devices WHERE token_hash=? AND revoked=0').get(hash(token)) as Row | undefined;
+    const row = this.db.prepare('SELECT d.id,d.vault_id FROM devices d JOIN vaults v ON v.id=d.vault_id WHERE d.token_hash=? AND d.revoked=0 AND v.archived=0').get(hash(token)) as Row | undefined;
     if (!row) throw new SyncError('unauthorized', '设备未授权或已撤销', 401);
     return { vaultId: row.vault_id, deviceId: row.id };
   }
@@ -110,7 +112,7 @@ export class Store implements Backend {
   private vault(vaultId: string): Row {
     assertId(vaultId);
     const vault = this.db.prepare('SELECT * FROM vaults WHERE id=?').get(vaultId) as Row | undefined;
-    if (!vault) throw new SyncError('vault_missing', '仓库不存在', 404);
+    if (!vault || vault.archived) throw new SyncError('vault_missing', '仓库不存在', 404);
     return vault;
   }
   private exclusions(vaultId: string): string[] { return normalizeExclusions(JSON.parse(this.vault(vaultId).excluded_paths)); }
@@ -118,6 +120,9 @@ export class Store implements Backend {
     const result = { id: id(), name: managementName(name) };
     this.db.prepare('INSERT INTO vaults(id,name,created_at) VALUES (?,?,?)').run(result.id, result.name, Date.now());
     return result;
+  }
+  archiveVault(vaultId: string): void {
+    this.transaction(() => { this.vault(vaultId); this.db.prepare('UPDATE vaults SET archived=1 WHERE id=?').run(vaultId); });
   }
   renameVault(vaultId: string, name: string): void {
     this.vault(vaultId); this.db.prepare('UPDATE vaults SET name=? WHERE id=?').run(managementName(name), vaultId);
@@ -127,7 +132,7 @@ export class Store implements Backend {
     this.db.prepare('UPDATE vaults SET excluded_paths=? WHERE id=?').run(JSON.stringify(rules), vaultId); return rules;
   }
   listVaults(): VaultSummary[] {
-    return (this.db.prepare('SELECT * FROM vaults ORDER BY COALESCE(created_at,0) DESC,id').all() as Row[]).map(vault => {
+    return (this.db.prepare('SELECT * FROM vaults WHERE archived=0 ORDER BY COALESCE(created_at,0) DESC,id').all() as Row[]).map(vault => {
       const files = (this.db.prepare('SELECT DISTINCT file_id FROM heads WHERE vault_id=?').all(vault.id) as Row[]).map(r => this.file(vault.id, r.file_id));
       return { id: vault.id, name: vault.name, createdAt: vault.created_at ?? null, ...summarizeFiles(files),
         revisionCount: Number((this.db.prepare('SELECT COUNT(*) n FROM revisions WHERE vault_id=?').get(vault.id) as Row).n),
@@ -145,14 +150,14 @@ export class Store implements Backend {
       if (!found) throw new SyncError('invalid_cursor', '变更记录游标已失效，请重新加载', 400);
       beforeSeq = Number(found.seq);
     }
-    const rows = this.db.prepare(`SELECT c.seq,c.vault_id,r.payload,r.created_at,v.name vault_name,d.name device_name FROM changes c JOIN revisions r ON r.vault_id=c.vault_id AND r.id=c.revision_id JOIN vaults v ON v.id=c.vault_id LEFT JOIN devices d ON d.id=json_extract(r.payload,'$.clientId') WHERE c.seq<? ${vaultId === undefined ? '' : 'AND c.vault_id=?'} ORDER BY c.seq DESC LIMIT ?`)
+    const rows = this.db.prepare(`SELECT c.seq,c.vault_id,r.payload,r.created_at,v.name vault_name,d.name device_name FROM changes c JOIN revisions r ON r.vault_id=c.vault_id AND r.id=c.revision_id JOIN vaults v ON v.id=c.vault_id LEFT JOIN devices d ON d.id=json_extract(r.payload,'$.clientId') WHERE c.seq<? AND v.archived=0 ${vaultId === undefined ? '' : 'AND c.vault_id=?'} ORDER BY c.seq DESC LIMIT ?`)
       .all(...(vaultId === undefined ? [beforeSeq, limit + 1] : [beforeSeq, vaultId, limit + 1])) as Row[];
     const parentQuery = this.db.prepare('SELECT payload FROM revisions WHERE vault_id=? AND id=?');
     const items = rows.slice(0, limit).map(row => {
       const r = JSON.parse(row.payload) as Revision;
       return { id: activityId(row.vault_id, r.id), vaultId: row.vault_id, vaultName: row.vault_name, fileId: r.fileId, path: r.path,
         action: revisionAction(r, parent => { const p = parentQuery.get(row.vault_id, parent) as Row | undefined; return p && JSON.parse(p.payload); }),
-        deviceId: r.clientId, deviceName: row.device_name ?? '未知设备', bytes: r.size, createdAt: row.created_at ?? null };
+        deviceId: r.clientId, deviceName: r.clientId === 'admin-restore' ? '管理员' : row.device_name ?? '未知设备', bytes: r.size, createdAt: row.created_at ?? null };
     });
     return { items, nextCursor: rows.length > limit ? items[items.length - 1].id : null };
   }
@@ -177,7 +182,7 @@ export class Store implements Backend {
     return { serverId: this.serverId, epoch: this.epoch, cursor: page.length ? Number(page[page.length - 1].seq) : after,
       more: rows.length > limit, changes: page.map(r => ({ seq: Number(r.seq), file: JSON.parse(r.payload) })), excludedPaths: this.exclusions(vaultId) };
   }
-  commit(vaultId: string, input: unknown, deviceId: string): CommitResult {
+  commit(vaultId: string, input: unknown, deviceId: string, expectedHeads?: string[]): CommitResult {
     const revision = validateRevision(input);
     if (revision.clientId !== deviceId) throw new SyncError('wrong_device', '修订必须属于当前设备', 403);
     return this.transaction(() => {
@@ -188,6 +193,7 @@ export class Store implements Backend {
       }
       if (isExcluded(revision.path, this.exclusions(vaultId))) throw new SyncError('path_excluded', '该路径已被仓库排除规则暂停同步', 409);
       const existing = this.file(vaultId, revision.fileId);
+      if (expectedHeads && JSON.stringify(existing.heads.map(h => h.id).sort()) !== JSON.stringify([...expectedHeads].sort())) throw new SyncError('heads_changed', '文件已发生变化，请重新查看后再操作', 409);
       if (existing.heads.length && !revision.parents.length) throw new SyncError('missing_parent', '已有文件不能创建第二个无父版本');
       if (!existing.heads.length) {
         const count = Number((this.db.prepare('SELECT COUNT(DISTINCT file_id) n FROM heads WHERE vault_id=?').get(vaultId) as Row).n);
@@ -216,12 +222,19 @@ export class Store implements Backend {
       return result;
     });
   }
-  history(vaultId: string, fileId: string, beforeInput?: Cursor): { seq: number; revision: Revision }[] {
+  history(vaultId: string, fileId: string, beforeInput?: Cursor): { seq: number; revision: Revision; createdAt: number | null }[] {
     const before = beforeInput === undefined ? Number.MAX_SAFE_INTEGER : Number(beforeInput);
     if (!Number.isSafeInteger(before) || before < 0) throw new SyncError('invalid_cursor', '历史游标无效', 400);
     assertId(fileId);
-    return (this.db.prepare('SELECT c.seq,r.payload FROM changes c JOIN revisions r ON r.vault_id=c.vault_id AND r.id=c.revision_id WHERE c.vault_id=? AND c.file_id=? AND c.seq<? ORDER BY c.seq DESC LIMIT 100').all(vaultId, fileId, before) as Row[])
-      .map(r => ({ seq: Number(r.seq), revision: JSON.parse(r.payload) }));
+    return (this.db.prepare('SELECT c.seq,r.payload,r.created_at FROM changes c JOIN revisions r ON r.vault_id=c.vault_id AND r.id=c.revision_id WHERE c.vault_id=? AND c.file_id=? AND c.seq<? ORDER BY c.seq DESC LIMIT 100').all(vaultId, fileId, before) as Row[])
+      .map(r => ({ seq: Number(r.seq), revision: JSON.parse(r.payload), createdAt: r.created_at ?? null }));
+  }
+  historyPoint(vaultId: string, revisionId: string): FileState[] {
+    assertId(vaultId); assertId(revisionId); this.vault(vaultId);
+    const point = this.db.prepare('SELECT seq FROM changes WHERE vault_id=? AND revision_id=?').get(vaultId, revisionId) as Row | undefined;
+    if (!point) throw new SyncError('revision_missing', '仓库历史版本不存在', 404);
+    const rows = this.db.prepare('SELECT c.payload FROM changes c JOIN (SELECT file_id,MAX(seq) seq FROM changes WHERE vault_id=? AND seq<=? GROUP BY file_id) latest ON c.seq=latest.seq WHERE c.vault_id=? ORDER BY c.file_id').all(vaultId, point.seq, vaultId) as Row[];
+    return rows.map(row => JSON.parse(row.payload));
   }
   known(vaultId: string, ids: unknown): string[] {
     if (!Array.isArray(ids) || ids.length > 100) throw new SyncError('invalid_check', '每次最多核对 100 个版本', 400);
@@ -238,7 +251,7 @@ export class Store implements Backend {
     writeFileSync(join(target, 'backup.json'), JSON.stringify({ protocol: PROTOCOL, serverId: this.serverId, createdAt: new Date().toISOString(), complete: true }, null, 2));
   }
   close(): void { this.db.close(); }
-  devices(): DeviceInfo[] { return this.db.prepare('SELECT id,vault_id,name,revoked FROM devices').all() as unknown as DeviceInfo[]; }
+  devices(): DeviceInfo[] { return this.db.prepare('SELECT d.id,d.vault_id,d.name,d.revoked FROM devices d JOIN vaults v ON v.id=d.vault_id WHERE v.archived=0').all() as unknown as DeviceInfo[]; }
   revoke(deviceId: string): void { assertId(deviceId); this.db.prepare('UPDATE devices SET revoked=1 WHERE id=?').run(deviceId); }
   health(): void { this.db.prepare('SELECT 1').get(); }
 }

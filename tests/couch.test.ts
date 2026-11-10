@@ -77,6 +77,35 @@ test('real CouchDB: immutable business history survives compaction, and export v
   const backup = join(f.root, 'backup'); await f.store.backup(backup);
   assert.equal(JSON.parse(readFileSync(join(backup, 'backup.json'), 'utf8')).complete, true); assert.equal(existsSync(join(backup, 'couchdb.jsonl')), true);
 });
+test('real CouchDB: whole vault restore reconstructs old state after restart and retains later versions', real, async t => {
+  const f = await couchFixture(t), firstBytes = Buffer.from('first'), secondBytes = Buffer.from('second');
+  await f.remoteA.put(firstBytes, hash(firstBytes)); await f.remoteA.put(secondBytes, hash(secondBytes));
+  const a = revision(f.first.deviceId, firstBytes, {path: 'a.md'}); await f.remoteA.commit(a);
+  const b = revision(f.first.deviceId, firstBytes, {path: 'b.md'}); await f.remoteA.commit(b);
+  const updated = revision(f.first.deviceId, secondBytes, {fileId: a.fileId, parents: [a.id], path: 'a.md'}); await f.remoteA.commit(updated);
+  const extra = revision(f.first.deviceId, secondBytes, {path: 'c.md'}); await f.remoteA.commit(extra);
+  const reopened = await CouchStore.open(f.options);
+  try {
+    const point = await reopened.historyPoint(f.first.vaultId, b.id);
+    assert.equal(point.length, 2); assert.equal(point.find(x => x.fileId === a.fileId)!.heads[0].id, a.id);
+  } finally { await reopened.close(); }
+  const server = makeServer(f.store, undefined, undefined, {password: 'test-admin-password'});
+  await new Promise<void>(done => server.listen(0, '127.0.0.1', done));
+  t.after(async () => { await new Promise<void>(done => {server.close(() => done()); server.closeAllConnections();}); });
+  const url = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  const login = await fetch(url + '/admin/api/login', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({password: 'test-admin-password'})});
+  const cookie = login.headers.get('set-cookie')!.split(';')[0], csrf = (await login.json() as any).csrfToken;
+  const path = `/admin/api/vaults/${f.first.vaultId}/restore`;
+  const preview = await (await fetch(url + path + '?point=' + b.id, {headers: {Cookie: cookie}})).json() as any;
+  assert.equal(preview.actions.length, 2);
+  const result = await fetch(url + path, {method: 'POST', headers: {Cookie: cookie, 'X-CSRF-Token': csrf, 'Content-Type': 'application/json'}, body: JSON.stringify({point: b.id, fingerprint: preview.fingerprint})});
+  assert.equal(result.status, 200);
+  const snapshot = await f.store.snapshot(f.first.vaultId);
+  assert.equal(snapshot.files.find(x => x.fileId === a.fileId)!.heads[0].hash, a.hash);
+  assert.equal(snapshot.files.find(x => x.fileId === extra.fileId)!.heads[0].deleted, true);
+  const history = await f.store.history(f.first.vaultId, a.fileId);
+  assert.equal(history.length, 3); assert.deepEqual(history[0].revision.parents, [updated.id]);
+});
 test('real CouchDB: a second independent gateway volume cannot write to the same database', real, async t => {
   const f = await couchFixture(t);
   await assert.rejects(CouchStore.open({ ...f.options, root: join(f.root, 'unrelated-gateway') }), /另一套网关/);

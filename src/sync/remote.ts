@@ -53,6 +53,11 @@ export class Remote {
     if (JSON.stringify(validateRevision(r.revision)) !== JSON.stringify(validateRevision(revision))) throw new Error('提交回执与本地修订不一致');
     return r;
   }
+  async commitStrict(revision: Revision, expectedHeads: string[]): Promise<CommitResult> {
+    const r = JSON.parse((await this.request(this.path('reconcile'), 'POST', Buffer.from(JSON.stringify({ revision, expectedHeads })))).toString('utf8')) as CommitResult;
+    if (JSON.stringify(validateRevision(r.revision)) !== JSON.stringify(validateRevision(revision))) throw new Error('提交回执与本地修订不一致');
+    return r;
+  }
   async history(fileId: string, before?: Cursor): Promise<{ seq: Cursor; revision: Revision }[]> {
     const value = JSON.parse((await this.request(this.path('history/' + fileId + (before !== undefined ? '?before=' + encodeURIComponent(before) : '')))).toString('utf8'));
     return value.revisions.map((r: any) => ({ seq: r.seq, revision: validateRevision(r.revision) }));

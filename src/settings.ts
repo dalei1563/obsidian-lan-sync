@@ -5,12 +5,12 @@ import { normalizeExclusions } from '../shared/exclusions';
 export interface LanSettings {
   server: string; allowHttp: boolean; enabled: boolean; vaultId: string;
   vaultName: string; deviceId: string; serverId: string; secretId: string;
-  excludedPaths: string[];
+  excludedPaths: string[]; autoUpdate: boolean;
 }
 export const DEFAULT_SETTINGS: LanSettings = {
   server: 'http://127.0.0.1:27123', allowHttp: false, enabled: false,
   vaultId: '', vaultName: '', deviceId: '', serverId: '', secretId: '',
-  excludedPaths: [],
+  excludedPaths: [], autoUpdate: true,
 };
 export class LanSettingTab extends PluginSettingTab {
   private connectionDraft = '';
@@ -34,13 +34,15 @@ export class LanSettingTab extends PluginSettingTab {
       }));
     } else {
       card.createEl('p', { text: `已连接：${plugin.settings.vaultName}` });
-      if (!plugin.engine?.state.initialized) new Setting(containerEl).setName('首次同步').setDesc('绑定已保存。先确认要上传、下载的笔记，再开始；预览失败可直接重试，无需再次输入连接码。').addButton(b => b.setButtonText(plugin.previewing ? '正在获取预览…' : '预览首次同步').setDisabled(plugin.previewing).setCta().onClick(() => {
+      new Setting(containerEl).setName(plugin.engine?.state.initialized ? '覆盖同步' : '首次同步').setDesc('选择云端或本地作为准，各项修改和删除会先显示供你确认。').addButton(b => b.setButtonText(plugin.previewing ? '正在获取预览…' : '选择并预览').setDisabled(plugin.previewing).setCta().onClick(() => {
         b.setDisabled(true); void plugin.action(() => plugin.preview()).finally((): void => { if (!plugin.unloaded) { b.setDisabled(false); this.refreshBinding(); } });
       }));
-      new Setting(containerEl).setName('自动同步').setDesc('正常写作即可；断网后会在恢复连接时重试。').addToggle(t => t.setValue(plugin.settings.enabled).setDisabled(!plugin.engine?.state.initialized).onChange(async enabled => {
+      new Setting(containerEl).setName('自动同步').setDesc('正常写作即可；断网后会在恢复连接时重试。').addToggle(t => t.setValue(plugin.settings.enabled).setDisabled(!plugin.engine?.state.initialized || !!plugin.engine?.state.overwrite).onChange(async enabled => {
         plugin.settings.enabled = enabled; await plugin.saveSettings(); plugin.setStatus(enabled ? '等待同步' : '自动同步已暂停'); if (enabled) await plugin.sync(true);
       }));
       new Setting(containerEl).addButton(b => b.setButtonText('立即同步').setCta().onClick(() => void plugin.action(() => plugin.sync(true)))).addButton(b => b.setButtonText('查看待处理项').onClick(() => void plugin.action(() => plugin.showIssues())));
+      new Setting(containerEl).setName('插件自动更新').setDesc('从已连接的同步服务检查并下载新版，重启 Obsidian 后生效；笔记和连接配置会保留。').addToggle(t => t.setValue(plugin.settings.autoUpdate).onChange(async enabled => { plugin.settings.autoUpdate = enabled; await plugin.saveSettings(); }));
+      new Setting(containerEl).addButton(b => b.setButtonText('检查插件更新').onClick(() => void plugin.action(() => plugin.checkUpdate(true))));
     }
     containerEl.createEl('h3', { text: '排除同步' });
     containerEl.createEl('p', { text: '.obsidian、当前配置目录和隐藏目录始终不参与同步。以下规则仅作用于当前本地笔记库，并与后台仓库规则合并。新增排除规则会暂停相关文件的上传、下载和删除；已同步内容会保留。' });
@@ -57,7 +59,7 @@ export class LanSettingTab extends PluginSettingTab {
     const serverRules = plugin.engine?.state.serverExcludedPaths ?? [];
     if (serverRules.length) containerEl.createEl('p', { text: '后台仓库排除规则：' + serverRules.join('；') });
     const details = containerEl.createEl('details'); details.createEl('summary', { text: '连接诊断与恢复' });
-    details.createEl('p', { text: '打开中的笔记会等待关闭后再接收远端替换。查看旧版本：打开笔记，执行“查看当前笔记历史”命令。' });
+    details.createEl('p', { text: '打开中的笔记会等待关闭后再接收远端替换。历史版本可在管理员后台查看和恢复。' });
     if (plugin.settings.vaultId) {
       details.createEl('p', { text: `服务：${plugin.settings.server}；设备：${plugin.settings.deviceId.slice(0, 8)}` });
       new Setting(details).addButton(b => b.setButtonText('检查连接').onClick(() => void plugin.action(async () => { await plugin.diagnose(); this.display(); })));

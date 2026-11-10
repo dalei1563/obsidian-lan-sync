@@ -42,7 +42,6 @@ foreach ($candidate in @($vault,$base,$plugins,$target)) {
   if ((Test-Path -LiteralPath $candidate) -and ((Get-Item -LiteralPath $candidate -Force).Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw 'Installation through a symbolic link or junction is not supported.' }
 }
 if (Test-Path -LiteralPath $target) {
-  if (-not $Upgrade) { throw 'Plugin is already installed. Use -Upgrade after closing Obsidian. Existing connection and state will be preserved.' }
   if (Get-Process -Name Obsidian -ErrorAction SilentlyContinue) { throw 'Close Obsidian before upgrading the plugin.' }
 }
 Add-Type -AssemblyName System.Net.Http
@@ -67,7 +66,17 @@ $pluginManifest = Get-Content -Raw -LiteralPath (Join-Path $stage 'manifest.json
 if ($pluginManifest.id -ne 'lan-note-sync' -or $pluginManifest.version -ne $manifest.version) { throw 'Downloaded plugin identity does not match.' }
 if (Test-Path -LiteralPath $target) {
   foreach ($item in Get-ChildItem -Force -LiteralPath $target) { if ($item.Name -notin $names) { Copy-Item -LiteralPath $item.FullName -Destination $stage -Recurse -Force } }
-  $backup = $target + '.backup-' + [Guid]::NewGuid().ToString()
+  $dataFile = Join-Path $stage 'data.json'
+  $bound = $false
+  if (Test-Path -LiteralPath $dataFile) {
+    $oldSettings = Get-Content -Raw -Encoding UTF8 -LiteralPath $dataFile | ConvertFrom-Json
+    $bound = -not [string]::IsNullOrWhiteSpace($oldSettings.vaultId)
+  }
+  if (-not $bound) { @{schema=1;connection=$Connection} | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $stage 'bootstrap.json') -Encoding UTF8 }
+  $backupRoot = Join-Path $base 'lan-note-sync-backups'
+  if ((Test-Path -LiteralPath $backupRoot) -and ((Get-Item -LiteralPath $backupRoot -Force).Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw 'Backup directory must not be a symbolic link.' }
+  New-Item -ItemType Directory -Force -Path $backupRoot | Out-Null
+  $backup = Join-Path $backupRoot ('lan-note-sync-' + [Guid]::NewGuid().ToString())
   $resolvedTarget = [IO.Path]::GetFullPath($target)
   $resolvedStage = [IO.Path]::GetFullPath($stage)
   if (-not $resolvedTarget.StartsWith([IO.Path]::GetFullPath($plugins) + [IO.Path]::DirectorySeparatorChar) -or -not $resolvedStage.StartsWith([IO.Path]::GetFullPath($plugins) + [IO.Path]::DirectorySeparatorChar)) { throw 'Unsafe installation target.' }

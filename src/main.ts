@@ -1,7 +1,7 @@
-import { FileSystemAdapter, MarkdownView, Modal, Notice, Plugin, requestUrl, Setting } from 'obsidian';
+import { FileSystemAdapter, Modal, Notice, Plugin, requestUrl, requireApiVersion, Setting } from 'obsidian';
 import { join } from 'node:path';
 import { hostname } from 'node:os';
-import { Cursor, id, PROTOCOL, Revision } from '../shared/protocol';
+import { id, PROTOCOL, Revision } from '../shared/protocol';
 import { DEFAULT_SETTINGS, LanSettings, LanSettingTab } from './settings';
 import { DiskState } from './sync/disk-state';
 import { Engine, newState } from './sync/engine';
@@ -11,6 +11,8 @@ import { Connection, decodeConnection } from '../shared/connection';
 import { Enrollment } from './sync/enrollment';
 import { normalizeExclusions } from '../shared/exclusions';
 import { DeadlineError, SingleFlight, withDeadline } from './sync/async-flow';
+import type { OverwriteMode } from './sync/overwrite-plan';
+import { updatePlugin } from './sync/updater';
 
 export default class LanSyncPlugin extends Plugin {
   settings: LanSettings = { ...DEFAULT_SETTINGS, excludedPaths: [] };
@@ -23,10 +25,14 @@ export default class LanSyncPlugin extends Plugin {
   private failures = 0;
   private nextAttempt = 0;
   private working = false;
+  private localGeneration = 0;
+  private cleanGeneration = -1;
+  private lastFullScan = 0;
   private disposed = false;
   private settingsTab?: LanSettingTab;
   private readonly connectionFlow = new SingleFlight();
   private readonly previewFlow = new SingleFlight();
+  private readonly updateFlow = new SingleFlight();
   private previewDialog?: Modal;
   private readonly workflowDialogs = new Set<Modal>();
   get connecting(): boolean { return this.connectionFlow.busy; }
@@ -59,13 +65,13 @@ export default class LanSyncPlugin extends Plugin {
     this.addRibbonIcon('refresh-cw', '局域网同步', () => void this.action(() => this.sync(true)));
     this.addCommand({ id: 'sync-now', name: '立即同步', callback: () => void this.action(() => this.sync(true)) });
     this.addCommand({ id: 'sync-issues', name: '查看冲突与待处理项', callback: () => void this.action(() => this.showIssues()) });
-    this.addCommand({ id: 'sync-history', name: '查看当前笔记历史', callback: () => void this.action(() => this.showHistory()) });
     this.addCommand({ id: 'sync-toggle', name: '暂停 / 恢复自动同步', callback: () => void this.action(async () => {
       this.settings.enabled = !this.settings.enabled; await this.saveSettings(); this.setStatus(this.settings.enabled ? '等待同步' : '自动同步已暂停');
       if (this.settings.enabled) await this.sync(true);
     }) });
     const changed = () => {
       if (!this.engine?.state.initialized || this.local?.applying || this.disposed) return;
+      this.localGeneration++;
       this.setStatus(this.settings.enabled ? '等待同步' : '本地待检查（自动同步已暂停）');
       if (!this.settings.enabled) return;
       if (this.debounce) window.clearTimeout(this.debounce);
@@ -78,7 +84,8 @@ export default class LanSyncPlugin extends Plugin {
       if (this.local?.applying || !this.engine?.state.initialized) return;
       void this.engine.noteRename(oldPath, file.path).then(changed).catch(() => this.setStatus('路径不受支持，请查看设置'));
     }));
-    this.registerInterval(window.setInterval(() => { if (this.settings.enabled && Date.now() >= this.nextAttempt) void this.sync(false); }, 5000));
+    this.registerInterval(window.setInterval(() => { if (this.settings.enabled && Date.now() >= this.nextAttempt) void this.sync(false, true); }, 5000));
+    this.registerInterval(window.setInterval(() => { if (this.settings.autoUpdate && this.settings.vaultId) void this.checkUpdate(false).catch(() => {}); }, 6 * 60 * 60 * 1000));
     this.registerEvent(this.app.workspace.on('active-leaf-change', changed));
     this.app.workspace.onLayoutReady(() => { void this.action(async () => {
       if (!this.settings.vaultId) {
@@ -87,6 +94,7 @@ export default class LanSyncPlugin extends Plugin {
       }
       await this.setup();
       if (this.settings.enabled) await this.sync(false);
+      if (this.settings.autoUpdate && this.settings.vaultId) void this.checkUpdate(false).catch(() => {});
     }); });
   }
   onunload(): void {
@@ -105,6 +113,19 @@ export default class LanSyncPlugin extends Plugin {
   private ensureActive(): void { if (this.disposed) throw new Error('插件已卸载，请重新启用后重试'); }
   private refreshSettings(): void { if (!this.disposed) this.settingsTab?.refreshBinding(); }
   saveSettings(): Promise<void> { return this.saveData(this.settings); }
+  checkUpdate(manual: boolean): Promise<void> {
+    return this.updateFlow.run('plugin-update', async () => {
+      this.ensureActive();
+      if (!this.settings.vaultId) throw new Error('请先连接同步服务');
+      const adapter = this.app.vault.adapter;
+      if (!(adapter instanceof FileSystemAdapter)) throw new Error('自动更新仅支持桌面端');
+      const root = join(adapter.getBasePath(), this.app.vault.configDir, 'plugins', this.manifest.id);
+      const result = await updatePlugin(normalizeServer(this.settings.server, this.settings.allowHttp), root, this.manifest.version, this.transport, requireApiVersion);
+      this.ensureActive();
+      if (result) new Notice(`插件 ${result} 已下载，重启 Obsidian 后生效。`, 10000);
+      else if (manual) new Notice('插件已经是服务端提供的最新版本。');
+    });
+  }
   private enrollment(): Enrollment {
     const adapter = this.app.vault.adapter;
     if (!(adapter instanceof FileSystemAdapter)) throw new Error('此版本仅支持 Windows 和 macOS 桌面端');
@@ -183,7 +204,7 @@ export default class LanSyncPlugin extends Plugin {
       if (state.serverId !== this.settings.serverId || state.vaultId !== this.settings.vaultId || state.clientId !== this.settings.deviceId) throw new Error('绑定与本地基线不匹配，已停止同步');
       this.local = new ObsidianVault(this.app, this.disk);
       this.engine = new Engine(new Remote(url, this.settings.vaultId, token, this.transport), this.local, state, s => this.disk!.save(s), m => this.setStatus(m), { excludedPaths: () => this.settings.excludedPaths, configDir: this.app.vault.configDir });
-      this.setStatus(!state.initialized ? '已配对，等待首次同步预览' : this.settings.enabled ? '等待同步' : '自动同步已暂停');
+      this.setStatus(state.overwrite ? '覆盖尚未完成，请在设置中重新预览' : !state.initialized ? '已配对，等待首次同步预览' : this.settings.enabled ? '等待同步' : '自动同步已暂停');
     } catch (e) { this.disk.close(); this.disk = undefined; throw e; }
   }
   async pair(code: string, server = this.settings.server, allowHttp = this.settings.allowHttp): Promise<void> {
@@ -215,24 +236,41 @@ export default class LanSyncPlugin extends Plugin {
     await this.setup();
     this.ensureActive();
     if (!this.engine) throw new Error('请先输入配对码连接服务');
-    if (this.engine.state.initialized) throw new Error('此 Vault 已初始化，请使用立即同步');
-    const p = await this.engine.preview();
-    this.ensureActive();
-    const modal = new Modal(this.app); modal.titleEl.setText('首次同步预览');
+    const modal = new Modal(this.app); modal.titleEl.setText('选择覆盖方向');
     modal.onClose = () => { this.previewDialog = undefined; if (!this.engine?.state.initialized && !this.disposed) this.setStatus('已配对，首次同步尚未开始'); };
-    modal.contentEl.createEl('p', { text: `本地 ${p.local} 篇，远端 ${p.remote} 个逻辑文件。` });
-    modal.contentEl.createEl('p', { text: `预计上传 ${p.upload} 篇、下载 ${p.download} 篇、相同 ${p.same} 篇、需选择版本 ${p.conflicts} 项。` });
-    modal.contentEl.createEl('p', { text: '同名不同内容将保留双方并等待处理。首次绑定不会把缺少的文件视为删除。' });
-    new Setting(modal.contentEl).addButton(b => b.setButtonText('取消').onClick(() => modal.close())).addButton(b => b.setButtonText('确认并开始同步').setCta().onClick(() => {
-      b.setDisabled(true); void this.action(async () => {
-        this.ensureActive(); await this.engine!.initialize(); this.ensureActive(); this.settings.enabled = true; await this.saveSettings(); this.ensureActive(); modal.close(); this.refreshSettings(); await this.sync(true);
-      // Obsidian controls are thenable; Promise callbacks must not return them.
-      }).finally((): void => { if (!this.disposed) b.setDisabled(false); });
-    }));
+    modal.contentEl.createEl('p', { text: '请选择以哪一端为准。下一步会列出具体变化，确认之前不会修改笔记。只处理未排除的 Markdown 文件。' });
+    if (this.engine.state.overwrite) modal.contentEl.createEl('p', { text: '上次覆盖未完成；请重新预览原方向，然后确认继续。' });
+    const choose = (mode: OverwriteMode) => { modal.close(); void this.action(() => this.previewDirection(mode)); };
+    new Setting(modal.contentEl).setName('云端覆盖本地').setDesc('本地会变成云端的样子，本地独有的笔记会被删除。请提前自行备份。').addButton(b => b.setButtonText('预览云端覆盖').onClick(() => choose('cloud-to-local')));
+    new Setting(modal.contentEl).setName('本地覆盖云端').setDesc('云端会变成本地的样子，云端独有的笔记会被删除；旧版本保留在后台。').addButton(b => b.setButtonText('预览本地覆盖').onClick(() => choose('local-to-cloud')));
     this.previewDialog = modal;
     try { await this.openMainModal(modal); } catch (e) { this.previewDialog = undefined; throw e; }
   }
-  async sync(manual: boolean): Promise<void> {
+  private async previewDirection(mode: OverwriteMode): Promise<void> {
+    const engine = this.engine; if (!engine) throw new Error('请先连接同步服务');
+    this.setStatus('正在比较本地与云端…');
+    const plan = await engine.previewOverwrite(mode); this.ensureActive();
+    const modal = new Modal(this.app); modal.titleEl.setText(mode === 'cloud-to-local' ? '确认云端覆盖本地' : '确认本地覆盖云端');
+    modal.contentEl.addClass('lan-sync-modal');
+    modal.contentEl.createEl('p', { text: `本地 ${plan.local} 篇，云端 ${plan.cloud} 篇，相同 ${plan.unchanged} 篇；将执行 ${plan.actions.length} 项变化。` });
+    const labels = { upload: '上传 / 覆盖云端', download: '下载 / 覆盖本地', 'delete-local': '删除本地', 'delete-cloud': '删除云端' };
+    modal.contentEl.createEl('pre', { text: plan.actions.map(a => `${labels[a.type]}：${a.path}`).join('\n') || '两端已经一致。' });
+    modal.contentEl.createEl('p', { text: mode === 'cloud-to-local' ? '本地独有笔记会被删除，同名笔记会被替换。请先自行备份整个本地笔记库。' : '云端删除和覆盖都会生成新版本，历史版本可在管理员后台查看和恢复。' });
+    let backedUp = mode !== 'cloud-to-local';
+    if (!backedUp) new Setting(modal.contentEl).setName('我已自行备份本地笔记库').addToggle(t => t.onChange(value => { backedUp = value; }));
+    new Setting(modal.contentEl).addButton(b => b.setButtonText('取消').onClick(() => modal.close())).addButton(b => b.setButtonText('确认并开始覆盖').setWarning().onClick(() => {
+      if (!backedUp) { new Notice('请先自行备份本地笔记库，并确认已备份。'); return; }
+      b.setDisabled(true); void this.action(async () => {
+        this.settings.enabled = false; await this.saveSettings();
+        modal.close(); this.refreshSettings();
+        await engine.startOverwrite(plan); this.ensureActive();
+        this.settings.enabled = true; await this.saveSettings(); this.refreshSettings();
+        new Notice('覆盖完成，自动同步已开启。');
+      }).finally((): void => { if (!this.disposed) { b.setDisabled(false); this.refreshSettings(); } });
+    }));
+    await this.openMainModal(modal);
+  }
+  async sync(manual: boolean, periodic = false): Promise<void> {
     if (this.disposed || this.working) return;
     if (!this.engine && this.settings.vaultId) {
       try { await this.setup(); } catch (e) { this.setStatus(e instanceof Error ? e.message : '初始化失败'); if (manual) throw e; return; }
@@ -241,7 +279,10 @@ export default class LanSyncPlugin extends Plugin {
     if (!manual && Date.now() < this.nextAttempt) return;
     this.working = true;
     try {
-      await this.engine.sync(); this.failures = 0; this.nextAttempt = 0;
+      const generation = this.localGeneration;
+      const idle = periodic && generation === this.cleanGeneration && Date.now() - this.lastFullScan < 60000;
+      await this.engine.sync(idle); this.failures = 0; this.nextAttempt = 0;
+      if (!idle) { this.cleanGeneration = generation; this.lastFullScan = Date.now(); }
       if (manual) new Notice('局域网同步：' + this.status);
     } catch (e) {
       this.failures++; this.nextAttempt = Date.now() + Math.min(60000, 5000 * 2 ** Math.min(this.failures - 1, 4));
@@ -298,22 +339,5 @@ export default class LanSyncPlugin extends Plugin {
     const modal = new Modal(this.app); modal.titleEl.setText(revision.deleted ? '删除版本' : revision.path); modal.contentEl.addClass('lan-sync-modal');
     modal.contentEl.createEl('pre', { text: data ? data.toString('utf8').slice(0, 12000) : '此版本表示删除；选择后文件会进入回收站。' });
     new Setting(modal.contentEl).addButton(b => b.setButtonText('选择这个版本').setCta().onClick(() => { modal.close(); this.confirmResolution(parent, fileId, revision, revision.id.slice(0, 8)); })); modal.open();
-  }
-  async showHistory(): Promise<void> {
-    const view = this.app.workspace.getActiveViewOfType(MarkdownView);
-    const engine = this.engine;
-    const entry = view?.file && engine ? Object.values(engine.state.entries).find(e => e.path === view.file!.path) : null;
-    if (!engine || !entry) throw new Error('请先打开一篇已参与同步的笔记');
-    const modal = new Modal(this.app); modal.titleEl.setText('历史版本：' + entry.path); modal.contentEl.addClass('lan-sync-modal');
-    const list = modal.contentEl.createDiv(); let before: Cursor | undefined;
-    const load = async () => {
-      const history = await engine.remote.history(entry.fileId, before);
-      for (const { seq, revision } of history) new Setting(list).setName(revision.deleted ? '删除版本' : revision.path).setDesc(`序号 ${seq} · ${revision.id.slice(0, 8)} · ${revision.size} 字节`).addButton(b => b.setButtonText('预览 / 恢复').onClick(() => void this.action(() => this.previewRevision(modal, entry.fileId, revision))));
-      before = history[history.length - 1]?.seq;
-      if (!history.length) list.createEl('p', { text: '没有更早的版本。' });
-      return history.length;
-    };
-    await load();
-    new Setting(modal.contentEl).addButton(b => b.setButtonText('加载更早的版本').onClick(() => { b.setDisabled(true); void this.action(async () => { if (before && await load()) b.setDisabled(false); }); })); modal.open();
   }
 }

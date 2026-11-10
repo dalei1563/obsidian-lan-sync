@@ -75,7 +75,7 @@ function reply(name: string) {
   return { status: 200, arrayBuffer: Uint8Array.from(Buffer.from(JSON.stringify(result))).buffer };
 }
 function pluginFixture(request: (options: any) => Promise<any>) {
-  const notices: string[] = [], secretWrites: string[] = [], claims = new Map<string, string>(), modals: any[] = [], buttons: any[] = [], textAreas: any[] = []; let completed = 0, setups = 0, previews = 0, syncs = 0;
+  const notices: string[] = [], secretWrites: string[] = [], claims = new Map<string, string>(), modals: any[] = [], buttons: any[] = [], textAreas: any[] = [], toggles: any[] = []; let completed = 0, setups = 0, previews = 0, syncs = 0;
   const app = { secretStorage: { setSecret: (_: string, value: string) => secretWrites.push(value) } };
   class Plugin { constructor(readonly app: unknown, readonly manifest: unknown) {} }
   class Element {
@@ -113,7 +113,7 @@ function pluginFixture(request: (options: any) => Promise<any>) {
       const input = { inputEl: { rows: 0, style: {}, setAttribute: () => {} }, change: (_: string) => {}, setValue(_: string) { return this; }, setPlaceholder(_: string) { return this; }, onChange(change: (value: string) => void) { this.change = change; return this; } };
       build(input); textAreas.push(input); return this;
     }
-    addToggle(build: (input: any) => void) { build({ setValue() { return this; }, setDisabled() { return this; }, onChange() { return this; } }); return this; }
+    addToggle(build: (input: any) => void) { const input = { change: (_: boolean) => {}, setValue() { return this; }, setDisabled() { return this; }, onChange(fn: (value: boolean) => void) { this.change = fn; return this; } }; build(input); toggles.push(input); return this; }
   }
   const obsidian = { Plugin, PluginSettingTab, FileSystemAdapter: class {}, MarkdownView: class {}, Modal, Setting, Notice: class { constructor(message: string) { notices.push(message); } }, requestUrl: request };
   const module = { exports: {} as any };
@@ -130,7 +130,7 @@ function pluginFixture(request: (options: any) => Promise<any>) {
   plugin.preview = async () => { previews++; };
   plugin.sync = async () => { syncs++; };
   plugin.openMainModal = async (modal: Modal) => { modal.open(); };
-  return { plugin, notices, secretWrites, saves, claims, modals, buttons, textAreas, createSettingTab: () => new module.exports.LanSettingTab(app, plugin), get completed() { return completed; }, get setups() { return setups; }, get previews() { return previews; }, get syncs() { return syncs; } };
+  return { plugin, notices, secretWrites, saves, claims, modals, buttons, textAreas, toggles, createSettingTab: () => new module.exports.LanSettingTab(app, plugin), get completed() { return completed; }, get setups() { return setups; }, get previews() { return previews; }, get syncs() { return syncs; } };
 }
 
 // An SDK thenable returned by finally starves both timers and node:test's own
@@ -240,58 +240,64 @@ test('canceling the actual first-sync preview keeps the binding and permits anot
   f.plugin.preview = Object.getPrototypeOf(f.plugin).preview.bind(f.plugin);
   await f.plugin.preview(); assert.equal(f.modals.length, 1); f.modals[0].close();
   assert.equal(f.plugin.settings.vaultId, 'saved-vault'); assert.equal(f.plugin.settings.enabled, false); assert.equal(initializations, 0); assert.equal(f.syncs, 0);
-  await f.plugin.preview(); assert.equal(f.modals.length, 2); assert.equal(previews, 2); assert.equal(initializations, 0); f.modals[1].close();
+  await f.plugin.preview(); assert.equal(f.modals.length, 2); assert.equal(previews, 0); assert.equal(initializations, 0); f.modals[1].close();
 });
 
-test('first-sync confirmation saves, starts sync, and restores the SDK thenable button without freezing', () => {
+test('overwrite confirmation saves the pause, executes the selected plan, and restores the thenable button', () => {
   isolatedUi(async (fixture, check: typeof assert) => {
     const f = fixture(async () => { throw new Error('unexpected request'); });
-    let initialize!: () => void, initializations = 0;
-    const pending = new Promise<void>(resolve => { initialize = resolve; });
+    let finish!: () => void, starts = 0;
+    const pending = new Promise<void>(resolve => { finish = resolve; });
+    const plan = {mode: 'local-to-cloud', local: 1, cloud: 0, unchanged: 0, actions: [], fingerprint: 'test'};
     f.plugin.settings.vaultId = 'saved-vault';
-    const state = { initialized: false };
-    f.plugin.engine = {
-      state, preview: async () => ({ local: 1, remote: 1, upload: 1, download: 1, same: 0, conflicts: 0 }),
-      initialize: async () => { initializations++; await pending; state.initialized = true; },
-    };
+    const state = {initialized: false};
+    f.plugin.engine = {state, previewOverwrite: async () => plan, startOverwrite: async () => { starts++; await pending; state.initialized = true; }};
     f.plugin.setup = async () => {};
     f.plugin.preview = Object.getPrototypeOf(f.plugin).preview.bind(f.plugin);
     await f.plugin.preview();
-    const modal = f.modals[0], button = modal.contentEl.buttons.find((b: any) => b.text === '确认并开始同步');
-    check.equal(initializations, 0); check.equal(f.syncs, 0);
-    button.click();
-    check.equal(button.disabled, true); check.equal(initializations, 1); check.equal(f.saves.length, 0);
-    initialize(); await new Promise<void>(resolve => setImmediate(resolve));
-    check.equal(state.initialized, true); check.equal(f.plugin.settings.enabled, true);
-    check.equal(f.saves.length, 1); check.equal(f.saves[0].enabled, true); check.equal(f.syncs, 1);
-    check.equal(modal.isOpen, false); check.equal(button.disabled, false);
-    check.deepEqual(button.disabledHistory, [true, false]); check.equal(button.thenCalls, 0);
+    f.modals[0].contentEl.buttons.find((b: any) => b.text === '预览本地覆盖').click();
+    await new Promise<void>(resolve => setImmediate(resolve));
+    const modal = f.modals[1], button = modal.contentEl.buttons.find((b: any) => b.text === '确认并开始覆盖');
+    button.click(); check.equal(button.disabled, true);
+    await new Promise<void>(resolve => setImmediate(resolve));
+    check.equal(starts, 1); check.equal(f.saves[0].enabled, false);
+    finish(); await new Promise<void>(resolve => setImmediate(resolve));
+    check.equal(f.plugin.settings.enabled, true); check.equal(f.saves[1].enabled, true);
+    check.equal(button.disabled, false); check.equal(button.thenCalls, 0);
   });
 });
 
-test('failed first-sync confirmation reports the error, restores the thenable button, and can retry', () => {
+test('failed overwrite remains paused and allows the user to preview again', () => {
   isolatedUi(async (fixture, check: typeof assert) => {
     const f = fixture(async () => { throw new Error('unexpected request'); });
-    let initializations = 0;
+    const plan = {mode: 'local-to-cloud', local: 1, cloud: 0, unchanged: 0, actions: [], fingerprint: 'test'};
     f.plugin.settings.vaultId = 'saved-vault';
-    const state = { initialized: false };
-    f.plugin.engine = {
-      state, preview: async () => ({ local: 1, remote: 0, upload: 1, download: 0, same: 0, conflicts: 0 }),
-      initialize: async () => { if (++initializations === 1) throw new Error('initialization failed'); state.initialized = true; },
-    };
+    f.plugin.engine = {state: {initialized: false}, previewOverwrite: async () => plan, startOverwrite: async () => { throw new Error('overwrite failed'); }};
     f.plugin.setup = async () => {};
     f.plugin.preview = Object.getPrototypeOf(f.plugin).preview.bind(f.plugin);
-    await f.plugin.preview();
-    const modal = f.modals[0], button = modal.contentEl.buttons.find((b: any) => b.text === '确认并开始同步');
-    button.click(); check.equal(button.disabled, true);
+    await f.plugin.preview(); f.modals[0].contentEl.buttons.find((b: any) => b.text === '预览本地覆盖').click();
     await new Promise<void>(resolve => setImmediate(resolve));
-    check.equal(modal.isOpen, true); check.equal(button.disabled, false); check.equal(button.thenCalls, 0);
-    check.equal(state.initialized, false); check.equal(f.plugin.settings.enabled, false);
-    check.equal(f.saves.length, 0); check.equal(f.syncs, 0); check.deepEqual(f.notices, ['initialization failed']);
-    button.click(); check.equal(button.disabled, true);
+    const button = f.modals[1].contentEl.buttons.find((b: any) => b.text === '确认并开始覆盖');
+    button.click(); await new Promise<void>(resolve => setImmediate(resolve));
+    check.equal(button.disabled, false); check.equal(button.thenCalls, 0); check.equal(f.plugin.settings.enabled, false);
+    check.deepEqual(f.notices, ['overwrite failed']);
+    await f.plugin.preview(); check.equal(f.modals.length, 3);
+  });
+});
+
+test('cloud overwrite does not begin until the user confirms their own backup', () => {
+  isolatedUi(async (fixture, check: typeof assert) => {
+    const f = fixture(async () => { throw new Error('unexpected request'); }); let starts = 0;
+    const plan = {mode: 'cloud-to-local', local: 1, cloud: 0, unchanged: 0, actions: [], fingerprint: 'test'};
+    f.plugin.settings.vaultId = 'saved-vault';
+    f.plugin.engine = {state: {initialized: false}, previewOverwrite: async () => plan, startOverwrite: async () => { starts++; }};
+    f.plugin.setup = async () => {}; f.plugin.preview = Object.getPrototypeOf(f.plugin).preview.bind(f.plugin);
+    await f.plugin.preview(); f.modals[0].contentEl.buttons.find((b: any) => b.text === '预览云端覆盖').click();
     await new Promise<void>(resolve => setImmediate(resolve));
-    check.equal(initializations, 2); check.equal(f.syncs, 1); check.equal(modal.isOpen, false);
-    check.deepEqual(button.disabledHistory, [true, false, true, false]); check.equal(button.thenCalls, 0);
+    const button = f.modals[1].contentEl.buttons.find((b: any) => b.text === '确认并开始覆盖');
+    button.click(); check.equal(starts, 0); check.equal(f.saves.length, 0); check.match(f.notices[0], /备份/);
+    f.toggles[0].change(true); button.click(); await new Promise<void>(resolve => setImmediate(resolve));
+    check.equal(starts, 1); check.equal(button.thenCalls, 0);
   });
 });
 
@@ -320,10 +326,10 @@ test('conflict confirmation restores SDK thenable buttons after both successful 
 
 test('settings connection, preview, and exclusions restore thenable buttons on success and error', () => {
   isolatedUi(async (fixture, check: typeof assert, connection, response) => {
-    for (const text of ['连接并预览', '预览首次同步', '保存排除规则']) {
+    for (const text of ['连接并预览', '选择并预览', '保存排除规则']) {
       for (const fail of [false, true]) {
         const f = fixture(async () => { if (fail) throw new Error('connection failed'); return response; });
-        if (text === '预览首次同步') {
+        if (text === '选择并预览') {
           f.plugin.settings.vaultId = 'saved-vault';
           f.plugin.engine = { state: { initialized: false } };
           if (fail) f.plugin.preview = async () => { throw new Error('preview failed'); };
@@ -340,7 +346,7 @@ test('settings connection, preview, and exclusions restore thenable buttons on s
         check.equal(f.notices.length, fail || text === '连接并预览' ? 1 : 0, text);
         if (fail) check.match(f.notices[0], /无法连接同步服务|preview failed|disk full/);
         else if (text === '连接并预览') { check.equal(f.plugin.settings.vaultId, 'ui-paired-vault'); check.equal(f.previews, 1); }
-        else if (text === '预览首次同步') check.equal(f.previews, 1);
+        else if (text === '选择并预览') check.equal(f.previews, 1);
         else { check.deepEqual(f.saves[0].excludedPaths, ['private/**', '*.tmp.md']); check.equal(f.plugin.status, '排除规则已保存'); }
         check.equal(f.syncs, 0);
       }

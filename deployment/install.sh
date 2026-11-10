@@ -29,7 +29,6 @@ vault=$(cd "$vault" && pwd -P)
 plugins="$vault/$config_dir/plugins"; target="$plugins/lan-note-sync"
 for candidate in "$vault/$config_dir" "$plugins" "$target"; do [ ! -L "$candidate" ] || { printf '%s\n' 'Symbolic link installation is not supported.' >&2; exit 1; }; done
 if [ -e "$target" ]; then
-  [ "$upgrade" -eq 1 ] || { printf '%s\n' 'Already installed. Close Obsidian and use --upgrade; connection and state will be preserved.' >&2; exit 1; }
   if pgrep -x Obsidian >/dev/null 2>&1; then printf '%s\n' 'Close Obsidian before upgrading.' >&2; exit 1; fi
 fi
 encoded=${connection#lansync:}
@@ -69,7 +68,16 @@ if [ -e "$target" ]; then
     case "${item##*/}" in manifest.json|main.js|styles.css|plan.json) ;; *) cp -R "$item" "$stage/";; esac
   done
   shopt -u dotglob nullglob
-  backup="$target.backup-$(date +%Y%m%d%H%M%S)-$$"
+  # Only replace pending enrollment when there is no saved binding. A malformed
+  # settings file is preserved rather than guessed at or implicitly rebound.
+  if [ ! -f "$stage/data.json" ] || grep -Eq '"vaultId"[[:space:]]*:[[:space:]]*""' "$stage/data.json"; then
+    umask 077
+    printf '{"schema":1,"connection":"%s"}\n' "$connection" > "$stage/bootstrap.json"
+  fi
+  backup_root="$vault/$config_dir/lan-note-sync-backups"
+  [ ! -L "$backup_root" ] || { printf '%s\n' 'Backup directory must not be a symbolic link.' >&2; exit 1; }
+  mkdir -p "$backup_root"
+  backup="$backup_root/lan-note-sync-$(date +%Y%m%d%H%M%S)-$$"
   case "$target" in "$plugins/lan-note-sync") ;; *) exit 1;; esac
   mv "$target" "$backup"
   if ! mv "$stage" "$target"; then mv "$backup" "$target"; exit 1; fi

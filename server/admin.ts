@@ -3,9 +3,10 @@ import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import type { Backend } from './backend';
-import { assertId, PROTOCOL, SyncError } from '../shared/protocol';
+import { assertId, id as newId, PROTOCOL, SyncError, type Cursor, type Revision } from '../shared/protocol';
 import { invitationInstructions } from './invitations';
 import { normalizeExclusions } from '../shared/exclusions';
+import { planVaultRestore, restoreFingerprint } from './vault-restore';
 
 export interface AdminOptions { password?: string; assetsDir?: string; secureCookie?: boolean; version?: string }
 interface Session { csrf: string; expiresAt: number }
@@ -37,6 +38,7 @@ export class AdminController {
   private readonly sessions = new Map<string, Session>();
   private readonly attempts = new Map<string, { count: number; until: number }>();
   private readonly seen = new Map<string, number>();
+  private readonly restoring = new Set<string>();
   private readonly assets = new Map<string, { bytes: Buffer; type: string }>();
   private readonly started = Date.now();
   private readonly cookieName: string;
@@ -54,6 +56,56 @@ export class AdminController {
     }
   }
   observeDevice(id: string): void { this.seen.set(id, Date.now()); }
+  isRestoring(vaultId: string): boolean { return this.restoring.has(vaultId); }
+  private async vaultRestore(vaultId: string, point: string, fingerprint?: string): Promise<unknown> {
+    assertId(point);
+    if (this.restoring.has(vaultId)) throw new SyncError('restore_busy', '仓库正在恢复，请稍后重试', 409);
+    if (fingerprint !== undefined) this.restoring.add(vaultId);
+    let completed = 0;
+    try {
+      const snapshot = await this.store.snapshot(vaultId);
+      const plan = planVaultRestore(point, snapshot, await this.store.historyPoint(vaultId, point));
+      if (fingerprint === undefined) return plan;
+      if (plan.fingerprint !== fingerprint) throw new SyncError('restore_changed', '预览后仓库发生变化，请重新预览', 409);
+      let expected = restoreFingerprint(snapshot);
+      const heads = new Map(snapshot.files.map(f => [f.fileId, f.heads[0]]));
+      const apply = async (source: Revision, deleted: boolean) => {
+        const before = await this.store.snapshot(vaultId);
+        if (restoreFingerprint(before) !== expected) throw new SyncError('restore_changed', '恢复期间仓库发生变化，请重新预览', 409);
+        const head = heads.get(source.fileId)!;
+        const revision: Revision = { ...source, id: newId(), parents: [head.id], deleted,
+          hash: deleted ? null : source.hash, size: deleted ? 0 : source.size, clientId: 'admin-restore' };
+        const result = await this.store.commit(vaultId, revision, 'admin-restore', [head.id]);
+        completed++; heads.set(source.fileId, result.revision);
+        const expectedFiles = before.files.map(f => f.fileId === source.fileId ? result.file : f);
+        expected = restoreFingerprint({...before, files: expectedFiles});
+      };
+      for (const action of plan.actions) if (action.predelete) await apply(action.before, true);
+      for (const action of plan.actions) {
+        const target = action.target;
+        if (!target || target.deleted) { if (!action.predelete) await apply(action.before, true); }
+        else await apply(target, false);
+      }
+      const final = await this.store.snapshot(vaultId);
+      if (restoreFingerprint(final) !== expected) throw new SyncError('restore_changed', '恢复期间仓库发生变化，请重新预览', 409);
+      return {ok: true, files: plan.actions.length, revisions: completed};
+    } catch (error) {
+      if (completed) throw new SyncError('restore_partial', `恢复已暂停，已有 ${completed} 个新版本写入；请重新预览同一时间点后继续。已有历史均保留。`, 409);
+      throw error;
+    } finally { if (fingerprint !== undefined) this.restoring.delete(vaultId); }
+  }
+  private async historical(vaultId: string, fileId: string, revisionId: string): Promise<Revision> {
+    assertId(revisionId); let before: Cursor | undefined;
+    for (;;) {
+      const page = await this.store.history(vaultId, fileId, before);
+      const found = page.find(item => item.revision.id === revisionId)?.revision;
+      if (found) return found;
+      if (page.length < 100) throw new SyncError('revision_missing', '历史版本不存在', 404);
+      const next = page[page.length - 1].seq;
+      if (next === before) throw new SyncError('invalid_cursor', '历史分页未前进', 409);
+      before = next;
+    }
+  }
   private sameOrigin(req: IncomingMessage): void {
     if (req.headers['sec-fetch-site'] === 'cross-site') throw new SyncError('csrf_denied', '请从管理页面发起操作', 403);
     const origin = req.headers.origin;
@@ -110,6 +162,8 @@ export class AdminController {
       if (!this.passwordHash) { json(res, 503, { configured: false, message: '管理页面尚未配置密码，请在服务端设置 SYNC_ADMIN_PASSWORD 后重建网关容器' }); return true; }
       if (req.method === 'POST' && path === '/admin/api/login') { await this.login(req, res, ip); return true; }
       const session = this.session(req, !['GET', 'HEAD'].includes(req.method ?? ''));
+      const vaultInPath = /^\/admin\/api\/vaults\/([\w-]+)/.exec(path)?.[1];
+      if (vaultInPath && this.restoring.has(vaultInPath)) throw new SyncError('restore_busy', '仓库正在恢复，请稍后重试', 409);
       if (req.method === 'GET' && path === '/admin/api/session') { json(res, 200, { authenticated: true, configured: true, csrfToken: session.csrf, version: this.version }); return true; }
       if (req.method === 'POST' && path === '/admin/api/logout') {
         for (const [token, value] of this.sessions) if (value === session) this.sessions.delete(token);
@@ -124,11 +178,72 @@ export class AdminController {
         if (req.method === 'GET') { json(res, 200, { vaults: await this.store.listVaults() }); return true; }
         if (req.method === 'POST') { json(res, 201, { vault: await this.store.createVault(name((await read(req))?.name)) }); return true; }
       }
-      const repo = /^\/admin\/api\/vaults\/([\w-]+)(?:\/(exclusions|invites))?$/.exec(path);
+      const vaultHistory = /^\/admin\/api\/vaults\/([\w-]+)\/restore$/.exec(path);
+      if (vaultHistory) {
+        const vaultId = vaultHistory[1]; assertId(vaultId);
+        if (req.method === 'GET') { const point = url.searchParams.get('point') ?? ''; json(res, 200, await this.vaultRestore(vaultId, point)); return true; }
+        if (req.method === 'POST') {
+          const input = await read(req); if (typeof input?.point !== 'string' || typeof input?.fingerprint !== 'string' || !/^[a-f0-9]{64}$/.test(input.fingerprint)) throw new SyncError('invalid_restore', '恢复预览无效', 400);
+          json(res, 200, await this.vaultRestore(vaultId, input.point, input.fingerprint)); return true;
+        }
+      }
+      const fileAction = /^\/admin\/api\/vaults\/([\w-]+)\/files\/([\w-]+)\/(history|restore)$/.exec(path);
+      if (fileAction) {
+        const [, vaultId, fileId, action] = fileAction; assertId(vaultId); assertId(fileId);
+        const current = (await this.store.snapshot(vaultId)).files.find(file => file.fileId === fileId);
+        if (!current) throw new SyncError('file_missing', '文件不存在', 404);
+        if (action === 'history' && req.method === 'GET') {
+          const revisionId = url.searchParams.get('revisionId');
+          if (revisionId) {
+            const revision = await this.historical(vaultId, fileId, revisionId);
+            const content = revision.deleted ? null : (await this.store.getObject(vaultId, revision.hash!)).toString('utf8');
+            json(res, 200, { revision, content }); return true;
+          }
+          const items = await this.store.history(vaultId, fileId, url.searchParams.get('before') || undefined);
+          json(res, 200, { items, heads: current.heads.map(h => h.id), nextCursor: items.length === 100 ? items[items.length - 1].seq : null }); return true;
+        }
+        if (action === 'restore' && req.method === 'POST') {
+          const input = await read(req); assertId(input?.revisionId);
+          if (!Array.isArray(input?.expectedHeads) || !input.expectedHeads.length || input.expectedHeads.length > 32 || new Set(input.expectedHeads).size !== input.expectedHeads.length) throw new SyncError('invalid_heads', '请重新查看当前版本后重试', 400);
+          input.expectedHeads.forEach(assertId);
+          const selected = await this.historical(vaultId, fileId, input.revisionId);
+          const revision = { ...selected, id: newId(), parents: [...input.expectedHeads].sort(), clientId: 'admin-restore' };
+          const result = await this.store.commit(vaultId, revision, 'admin-restore', input.expectedHeads);
+          json(res, 201, { revision: result.revision }); return true;
+        }
+        throw new SyncError('not_found', '管理接口不存在', 404);
+      }
+      const repo = /^\/admin\/api\/vaults\/([\w-]+)(?:\/(exclusions|invites|files|archive)(?:\/([\w-]+))?)?$/.exec(path);
       if (repo) {
-        const [, id, action] = repo; assertId(id);
+        const [, id, action, fileId] = repo; assertId(id);
+        if (fileId && action !== 'files') throw new SyncError('not_found', '管理接口不存在', 404);
         const vault = (await this.store.listVaults()).find(v => v.id === id);
         if (!vault) throw new SyncError('vault_missing', '仓库不存在', 404);
+        if (action === 'archive' && req.method === 'POST') {
+          if ((await read(req))?.name !== vault.name) throw new SyncError('vault_name_mismatch', '请输入完整仓库名称', 400);
+          await this.store.archiveVault(id); json(res, 200, {ok: true}); return true;
+        }
+        if (action === 'files' && req.method === 'GET' && fileId) {
+          assertId(fileId);
+          const file = (await this.store.snapshot(id)).files.find(f => f.fileId === fileId);
+          if (!file || file.heads.every(h => h.deleted)) throw new SyncError('file_missing', '文件不存在', 404);
+          if (file.heads.length !== 1) throw new SyncError('file_conflict', '文件有多个版本，请先在插件中处理冲突', 409);
+          const head = file.heads[0];
+          const content = await this.store.getObject(id, head.hash!);
+          json(res, 200, { path: head.path, content: content.toString('utf8'), revisionId: head.id }); return true;
+        }
+        if (action === 'files' && req.method === 'GET') {
+          const snapshot = await this.store.snapshot(id);
+          const files = snapshot.files.map(file => ({
+            fileId: file.fileId,
+            paths: [...new Set(file.heads.map(head => head.path))],
+            size: Math.max(0, ...file.heads.filter(head => !head.deleted).map(head => head.size)),
+            conflicts: file.heads.length > 1,
+            deleted: file.heads.every(head => head.deleted),
+          }));
+          files.sort((a, b) => a.paths[0].localeCompare(b.paths[0], 'zh-CN'));
+          json(res, 200, { files }); return true;
+        }
         if (!action && req.method === 'PATCH') { await this.store.renameVault(id, name((await read(req))?.name)); json(res, 200, { ok: true }); return true; }
         if (action === 'exclusions' && req.method === 'PUT') {
           const data = await read(req); let rules: string[];

@@ -1,10 +1,10 @@
-# LAN Note Sync 0.4：CouchDB + 独立 Obsidian 插件
+# LAN Note Sync 0.5：CouchDB + 独立 Obsidian 插件
 
 目标是把配置留在服务端：管理员部署一次，Windows 和 macOS 用户运行一条安装命令、选择笔记库，在 Obsidian 中启用插件并确认首次同步。
 
 这是一套独立实现，不依赖或派生自 Self-hosted LiveSync。CouchDB 负责持久化，插件和网关使用本项目自己的同步协议。当前是可试用版本，尚未完成 macOS 实机和长期运行验收。
 
-0.4.2 已修复首次同步确认后的界面卡死。已有设备请原地升级，保留原绑定与本地状态；详见[验收记录](docs/ADMIN_TEST_REPORT.md)。
+0.5 新增双向覆盖预览、后台文件和整库历史恢复、插件自动下载更新，以及 ZIP 手动安装。已有设备首次升级到 0.5 仍需运行一次安装命令；之后插件可自动下载新版，重启 Obsidian 后生效。
 
 ## 部署和接入
 
@@ -45,7 +45,7 @@ bash deployment/setup.sh --public-url http://192.168.1.10:27123 --expose-lan
 1. 在 Obsidian 建立或打开目标笔记库。
 2. 运行安装命令。Windows 只有一个已登记笔记库时自动选择，否则弹窗；macOS 弹窗选择。
 3. 在 Obsidian 的第三方插件中启用 **LAN Note Sync**。已有窗口未发现新插件时重新打开笔记库。
-4. 插件自动读取连接信息，展示首次同步预览；确认后开始同步。HTTP 内网连接另有一次明文连接提示。
+4. 插件自动读取连接信息；选择云端覆盖本地或本地覆盖云端，查看变化后确认。云端覆盖前需自行备份本地笔记库。HTTP 内网连接另有一次明文连接提示。
 
 首次启用第三方插件仍需用户操作。安装器不会替用户关闭受限模式或修改插件启用列表。
 
@@ -63,11 +63,13 @@ docker compose exec -T sync node dist/server/cli.cjs invite
 - 每个本地 Vault 独立绑定；多个 Vault 可连接同一个服务，远端数据按仓库隔离。
 - Markdown 新建、修改、移动、删除；保留 UTF-8 原始字节、BOM、CRLF 和空笔记。
 - 离线后重试、提交幂等、并发冲突保留、显式版本选择、历史预览及恢复。
-- 首次同步预览、发送和接收两侧的批量删除确认、本地替换快照、打开中的笔记延迟替换。
+- 首次及已绑定仓库均可选择覆盖方向，执行前列出变化；发送和接收两侧有批量删除确认。
+- 管理后台可预览文件和单个文件历史，也可将整个仓库恢复到一次变更后的状态；恢复会追加新版本。
+- 插件从服务自动下载更新（默认开启），重启 Obsidian 后生效；管理后台也提供 ZIP 手动安装。
 - 一次性连接码、设备独立凭证和撤销；永久凭证保存在 Obsidian 密钥存储。
 - CouchDB 自动初始化，Docker 数据卷持久化，网关异常重启后重新核对基线。
 
-首版仅面向 Windows/macOS 桌面端 **Markdown**；不含图片/PDF 等附件、移动端、配置同步、端到端加密、自动升级、自动服务器迁移或多网关高可用。每个文件最大 5 MiB，每库最多 10,000 个逻辑文件（包括已删除文件身份）；历史和快照不自动清理。
+首版仅面向 Windows/macOS 桌面端 **Markdown**；不含图片/PDF 等附件、移动端、配置同步、端到端加密、自动服务器迁移或多网关高可用。每个文件最大 5 MiB，每库最多 10,000 个逻辑文件（包括已删除文件身份）；历史和快照不自动清理。
 
 插件不直连 CouchDB。结构为：`Obsidian 插件 → HTTP(S) 网关 → CouchDB`。客户端不接触 CouchDB 管理员密码，也不需要配置 CouchDB CORS。Compose 只发布网关端口，数据库留在内部网络。
 
@@ -75,7 +77,7 @@ docker compose exec -T sync node dist/server/cli.cjs invite
 
 ## 验证结果
 
-2026-11-08：35 项自动化测试通过，包含真实 CouchDB 测试、Windows PowerShell 安装器和 Bash 安装器测试。Windows Obsidian 1.12.7 已验证自动接入、首次预览、同步和设置界面。
+自动化测试包含真实 CouchDB、Windows PowerShell 和 Bash 安装器、覆盖及历史恢复。Windows Obsidian 1.12.7 已验证自动接入、首次预览、同步和设置界面。
 
 两个生产 Docker 镜像已实际构建并运行，通过强制终止网关再启动后的身份、正文及历史保留验证。当前 Docker 集成环境使用 WSL 隔离守护进程和 host-network 测试覆盖；用户实际 Rocky Linux/1Panel 尚未验收。GHCR 双架构发布及 Windows/macOS/真实 CouchDB 远端 CI 已通过；macOS 安装脚本已在原生 CI 执行，但 macOS Obsidian GUI 尚未实机验收。
 

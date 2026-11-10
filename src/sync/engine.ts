@@ -1,6 +1,7 @@
-import { Cursor, FileState, hash, id, MAX_BYTES, pathKey, Revision, Snapshot, SyncError, validatePath } from '../../shared/protocol';
+import { assertHash, assertId, Cursor, FileState, hash, id, MAX_BYTES, pathKey, Revision, Snapshot, SyncError, validatePath, validateRevision } from '../../shared/protocol';
 import { Remote } from './remote';
 import { isExcluded, normalizeExclusions } from '../../shared/exclusions';
+import { planOverwrite, type OverwriteMode, type OverwritePlan } from './overwrite-plan';
 
 export interface ApplyRequest { oldPath: string; path: string; expectedHash: string | null; content: Buffer | null }
 export interface LocalVault {
@@ -8,6 +9,7 @@ export interface LocalVault {
   read(path: string): Promise<Buffer | null>;
   apply(request: ApplyRequest): Promise<void>;
   preserve(data: Buffer): Promise<void>;
+  assertClosed?(paths: string[]): void | Promise<void>;
 }
 export interface Entry {
   fileId: string;
@@ -36,6 +38,7 @@ export interface SyncState {
   deleteApproval?: string;
   applying?: { fileId: string; revision: Revision };
   serverExcludedPaths?: string[];
+  overwrite?: { plan: OverwritePlan; epoch: string; cursor: Cursor; index: number; operationIds: string[]; fileIds: string[] };
 }
 export function newState(serverId: string, vaultId: string, clientId: string): SyncState {
   return { schema: 1, serverId, vaultId, clientId, initialized: false, epoch: '', cursor: 0, remote: {}, entries: {}, pending: [], issues: {} };
@@ -60,6 +63,78 @@ export class Engine {
   private async scan(): Promise<Map<string, Buffer>> {
     const files = await this.local.scan(path => !this.isExcluded(path));
     return new Map([...files].filter(([path]) => !this.isExcluded(path)));
+  }
+  async previewOverwrite(mode: OverwriteMode): Promise<OverwritePlan> {
+    if (this.state.pending.length || Object.keys(this.state.issues).length) throw new Error('请先处理待上传内容和冲突，再执行覆盖');
+    if (this.state.overwrite && this.state.overwrite.plan.mode !== mode) throw new Error('已有未完成的覆盖，请先完成原来的方向');
+    const snapshot = await this.remote.snapshot(); this.checkIdentity(snapshot); this.policy(snapshot.excludedPaths);
+    return planOverwrite(mode, await this.scan(), snapshot, path => this.isExcluded(path));
+  }
+  startOverwrite(plan: OverwritePlan): Promise<void> {
+    return this.exclusive(async () => {
+      if (this.stopped) throw new Error('同步已停止，请重新打开插件');
+      const snapshot = await this.remote.snapshot(); this.checkIdentity(snapshot); this.policy(snapshot.excludedPaths);
+      if (this.state.pending.length || Object.keys(this.state.issues).length) throw new Error('请先处理待上传内容和冲突，再执行覆盖');
+      if (this.state.overwrite && this.state.overwrite.plan.mode !== plan.mode) throw new Error('已有未完成的覆盖，请先完成原来的方向');
+      const fresh = planOverwrite(plan.mode, await this.scan(), snapshot, path => this.isExcluded(path));
+      if (fresh.fingerprint !== plan.fingerprint) throw new Error('预览后笔记或云端发生变化，请重新预览');
+      await this.local.assertClosed?.(fresh.actions.map(a => a.path));
+      this.state.overwrite = { plan: fresh, epoch: snapshot.epoch, cursor: snapshot.cursor, index: 0,
+        operationIds: fresh.actions.map(() => id()), fileIds: fresh.actions.map(a => a.remote?.fileId ?? id()) };
+      await this.save(this.state);
+      await this.runOverwrite();
+    });
+  }
+  resumeOverwrite(): Promise<void> { return this.exclusive(() => this.runOverwrite()); }
+  private async runOverwrite(): Promise<void> {
+    const job = this.state.overwrite;
+    if (!job || !Array.isArray(job.plan?.actions) || !Array.isArray(job.operationIds) || !Array.isArray(job.fileIds) || !Number.isInteger(job.index) || job.index < 0 || job.index > job.plan.actions.length || job.operationIds.length !== job.plan.actions.length || job.fileIds.length !== job.plan.actions.length) throw new Error('覆盖任务无效，请保留本地状态并联系管理员');
+    if (!['cloud-to-local', 'local-to-cloud'].includes(job.plan.mode)) throw new Error('覆盖任务方向无效');
+    for (let i = 0; i < job.plan.actions.length; i++) {
+      const a = job.plan.actions[i]; validatePath(a.path); assertId(job.operationIds[i]); assertId(job.fileIds[i]);
+      if (a.localHash !== null) assertHash(a.localHash);
+      if (a.remote !== null) { const remote = validateRevision(a.remote); if (remote.deleted || remote.path !== a.path || remote.fileId !== job.fileIds[i]) throw new Error('覆盖任务远端版本无效'); }
+      if (job.plan.mode === 'cloud-to-local' && !((a.type === 'delete-local' && a.localHash !== null && !a.remote) || (a.type === 'download' && !!a.remote))) throw new Error('覆盖任务操作无效');
+      if (job.plan.mode === 'local-to-cloud' && !((a.type === 'delete-cloud' && a.localHash === null && !!a.remote) || (a.type === 'upload' && a.localHash !== null))) throw new Error('覆盖任务操作无效');
+    }
+    for (; job.index < job.plan.actions.length;) {
+      if (this.stopped) throw new Error('覆盖已暂停，请重新打开插件继续');
+      const action = job.plan.actions[job.index];
+      if (this.isExcluded(action.path)) throw new Error('排除规则已变化，请重新预览覆盖');
+      await this.local.assertClosed?.([action.path]);
+      const local = await this.local.read(action.path), currentHash = local === null ? null : hash(local);
+      if (job.plan.mode === 'cloud-to-local') {
+        const remote = await this.remote.snapshot(); this.checkIdentity(remote); this.policy(remote.excludedPaths);
+        if (remote.epoch !== job.epoch || remote.cursor !== job.cursor || this.isExcluded(action.path)) throw new Error('云端已发生变化，请重新预览覆盖');
+        const targetHash = action.type === 'delete-local' ? null : action.remote?.hash ?? null;
+        if (currentHash !== targetHash) {
+          if (currentHash !== action.localHash) throw new Error(`本地笔记已发生变化，请重新预览：${action.path}`);
+          const content = action.type === 'delete-local' ? null : await this.remote.get(action.remote!.hash!);
+          await this.local.apply({oldPath: action.path, path: action.path, expectedHash: action.localHash, content});
+        }
+      } else {
+        if (currentHash !== action.localHash) throw new Error(`本地笔记已发生变化，请重新预览：${action.path}`);
+        const deleted = action.type === 'delete-cloud', parents = action.remote ? [action.remote.id] : [];
+        const revision: Revision = {id: job.operationIds[job.index], fileId: job.fileIds[job.index], parents,
+          path: action.path, deleted, hash: deleted ? null : currentHash, size: deleted ? 0 : local!.length, clientId: this.state.clientId};
+        if (!deleted) await this.remote.put(local!, currentHash!);
+        await this.remote.commitStrict(revision, parents);
+      }
+      job.index++; await this.save(this.state);
+      this.report(`正在覆盖 ${job.index}/${job.plan.actions.length}`);
+    }
+    const final = await this.remote.snapshot(); this.checkIdentity(final); this.policy(final.excludedPaths);
+    const files = await this.scan(), remaining = planOverwrite(job.plan.mode, files, final, path => this.isExcluded(path));
+    if (remaining.actions.length) throw new Error('覆盖期间两端发生变化，请重新预览并继续');
+    const entries: Record<string, Entry> = Object.fromEntries(Object.entries(this.state.entries).filter(([, e]) => this.isExcluded(e.path)));
+    const live = new Map(final.files.flatMap(f => f.heads.length === 1 && !f.heads[0].deleted ? [[pathKey(f.heads[0].path), f.heads[0]] as const] : []));
+    for (const [path, bytes] of files) {
+      const head = live.get(pathKey(path)); if (!head || head.path !== path || head.hash !== hash(bytes)) throw new Error(`两端尚未一致，请重新预览：${path}`);
+      entries[head.fileId] = {fileId: head.fileId, path, basePath: path, baseRevision: head.id, baseHash: head.hash, baseDeleted: false, materialized: true};
+    }
+    this.state.entries = entries; this.state.remote = Object.fromEntries(final.files.map(f => [f.fileId, f]));
+    this.state.epoch = final.epoch; this.state.cursor = final.cursor; this.state.initialized = true; delete this.state.overwrite;
+    this.state.issues = {}; await this.save(this.state); this.report('覆盖完成，已同步');
   }
   private exclusive<T>(action: () => Promise<T>): Promise<T> {
     const result = this.tail.then(action);
@@ -127,9 +202,9 @@ export class Engine {
   approveDeletes(): Promise<void> {
     return this.exclusive(async () => { this.state.deleteApproval = this.state.deletePlan?.fingerprint; await this.save(this.state); });
   }
-  sync(): Promise<void> {
+  sync(idleCheck = false): Promise<void> {
     if (this.running) return this.running;
-    const run = this.exclusive(() => this.work());
+    const run = this.exclusive(() => this.work(idleCheck));
     this.running = run.finally(() => { this.running = undefined; }); return this.running;
   }
   private async pull(): Promise<void> {
@@ -240,6 +315,7 @@ export class Engine {
       if (file.heads.length !== 1) { this.state.issues[file.fileId] = '存在多个版本，请查看冲突'; continue; }
       const r = file.heads[0];
       if (blockDeletes && r.deleted) continue;
+      if (!e && r.deleted) continue;
       if (!e) {
         e = { fileId: file.fileId, path: r.path, basePath: r.path, baseRevision: null, baseHash: null, baseDeleted: true, materialized: false };
         this.state.entries[e.fileId] = e;
@@ -260,8 +336,14 @@ export class Engine {
     }
     if (!blockDeletes && this.state.deletePlan?.direction === 'remote') { delete this.state.deletePlan; delete this.state.deleteApproval; }
   }
-  private async work(): Promise<void> {
+  private async work(idleCheck: boolean): Promise<void> {
     if (this.stopped || !this.state.initialized) return;
+    if (this.state.overwrite) throw new Error('覆盖尚未完成，请在设置中继续或重新预览');
+    if (idleCheck && !this.state.applying && !this.state.pending.length && !Object.keys(this.state.issues).length && !this.state.deletePlan) {
+      const before = JSON.stringify([this.state.epoch, this.state.cursor, this.state.serverExcludedPaths]);
+      await this.pull();
+      if (before === JSON.stringify([this.state.epoch, this.state.cursor, this.state.serverExcludedPaths])) { this.report('已同步'); return; }
+    }
     this.report('正在同步…'); this.state.issues = {};
     await this.recoverApply(); await this.pull(); await this.stage(); await this.flush(); await this.pull(); await this.applyRemote();
     // A local edit made while uploading is not yet synced, even if the previous revision succeeded.

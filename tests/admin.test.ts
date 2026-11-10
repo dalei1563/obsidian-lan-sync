@@ -36,6 +36,7 @@ test('admin requires a password session, CSRF token and same origin; device toke
   assert.equal((await f.request('/admin/api/overview')).status, 401);
   const device = f.store.pair(f.store.createPair('Device Vault').code, 'Device');
   assert.equal((await f.request('/admin/api/overview', 'GET', undefined, { Authorization: 'Bearer ' + device.token })).status, 401);
+  assert.equal((await f.request(`/admin/api/vaults/${device.vaultId}/files`, 'GET', undefined, { Authorization: 'Bearer ' + device.token })).status, 401);
   assert.equal((await f.request('/admin/api/login', 'POST', { password: 'test-admin-password' }, { Origin: 'https://other.example' })).status, 403);
   const login = await f.login();
   assert.match(login.headers.get('set-cookie')!, /HttpOnly/); assert.match(login.headers.get('set-cookie')!, /SameSite=Strict/); assert.match(login.headers.get('set-cookie')!, /Path=\/admin/);
@@ -63,7 +64,28 @@ test('admin manages isolated repositories, invites, change records, exclusions a
   const denied = await f.request(`/v1/vaults/${b.id}/state`, 'GET', undefined, { Authorization: 'Bearer ' + pair.token }); assert.equal(denied.status, 403);
   const data = Buffer.from('hello'), revision = { id: id(), fileId: id(), parents: [], path: 'note.md', deleted: false, hash: hash(data), size: data.length, clientId: pair.deviceId };
   f.store.putObject(a.id, hash(data), data); f.store.commit(a.id, revision, pair.deviceId);
+  const files = await f.request(`/admin/api/vaults/${a.id}/files`);
+  assert.equal(files.status, 200); assert.deepEqual(files.value.files, [{ fileId: revision.fileId, paths: ['note.md'], size: data.length, conflicts: false, deleted: false }]);
+  const preview = await f.request(`/admin/api/vaults/${a.id}/files/${revision.fileId}`);
+  assert.equal(preview.status, 200); assert.equal(preview.value.content, 'hello'); assert.equal(preview.value.path, 'note.md');
+  assert.equal((await f.request(`/admin/api/vaults/${b.id}/files/${revision.fileId}`)).status, 404);
+  assert.deepEqual((await f.request(`/admin/api/vaults/${b.id}/files`)).value.files, []);
   const activity = await f.request('/admin/api/activity?vaultId=' + a.id); assert.equal(activity.status, 200); assert.equal(activity.value.items.length, 1); assert.equal(activity.value.items[0].action, 'create'); assert.equal(activity.value.items[0].deviceName, 'Windows');
+  const updatedData = Buffer.from('updated');
+  f.store.putObject(a.id, hash(updatedData), updatedData);
+  const updated = { ...revision, id: id(), parents: [revision.id], hash: hash(updatedData), size: updatedData.length };
+  f.store.commit(a.id, updated, pair.deviceId);
+  const history = await f.request(`/admin/api/vaults/${a.id}/files/${revision.fileId}/history`);
+  assert.equal(history.status, 200); assert.equal(history.value.items.length, 2); assert.deepEqual(history.value.heads, [updated.id]);
+  const historic = await f.request(`/admin/api/vaults/${a.id}/files/${revision.fileId}/history?revisionId=${revision.id}`);
+  assert.equal(historic.status, 200); assert.equal(historic.value.content, 'hello');
+  const endpoint = `/admin/api/vaults/${a.id}/files/${revision.fileId}/restore`;
+  assert.equal((await f.request(endpoint, 'POST', { revisionId: revision.id, expectedHeads: [revision.id] })).status, 409);
+  const restored = await f.request(endpoint, 'POST', { revisionId: revision.id, expectedHeads: [updated.id] });
+  assert.equal(restored.status, 201); assert.notEqual(restored.value.revision.id, revision.id);
+  assert.deepEqual(restored.value.revision.parents, [updated.id]); assert.equal(restored.value.revision.hash, revision.hash);
+  assert.equal(f.store.history(a.id, revision.fileId).length, 3);
+  assert.equal((await f.request(endpoint, 'POST', { revisionId: revision.id, expectedHeads: [updated.id] })).status, 409);
   const rules = await f.request(`/admin/api/vaults/${a.id}/exclusions`, 'PUT', { excludedPaths: ['private/**', '*.secret.md'] }); assert.equal(rules.status, 200);
   assert.deepEqual(f.store.snapshot(a.id).excludedPaths, rules.value.excludedPaths);
   const blocked = { ...revision, id: id(), fileId: id(), path: 'private/note.md' }; assert.throws(() => f.store.commit(a.id, blocked, pair.deviceId), /排除/);
@@ -78,6 +100,54 @@ test('admin login is rate limited and ignores spoofed forwarded IPs', async t =>
   const f = await setup(t);
   for (let i = 0; i < 5; i++) assert.equal((await f.request('/admin/api/login', 'POST', { password: 'wrong' }, { 'X-Forwarded-For': '192.0.2.' + i })).status, 401);
   const sixth = await f.request('/admin/api/login', 'POST', { password: 'test-admin-password' }); assert.equal(sixth.status, 429); assert.ok(Number(sixth.headers.get('retry-after')) > 0);
+});
+
+test('whole vault restore previews a historical point, creates new revisions, and keeps newer history', async t => {
+  const f = await setup(t); await f.login();
+  const paired = f.store.pair(f.store.createPair('History').code, 'Device');
+  const make = (path: string, value: string, previous?: any) => {
+    const data = Buffer.from(value); f.store.putObject(paired.vaultId, hash(data), data);
+    const revision = {id: id(), fileId: previous?.fileId ?? id(), parents: previous ? [previous.id] : [], path, deleted: false, hash: hash(data), size: data.length, clientId: paired.deviceId};
+    f.store.commit(paired.vaultId, revision, paired.deviceId); return revision;
+  };
+  const a = make('a.md', 'old a'), b = make('b.md', 'old b');
+  const changed = make('a.md', 'new a', a);
+  const deleted = {...b, id: id(), parents: [b.id], deleted: true, hash: null, size: 0};
+  f.store.commit(paired.vaultId, deleted, paired.deviceId); const c = make('c.md', 'new c');
+  const url = `/admin/api/vaults/${paired.vaultId}/restore`;
+  const preview = await f.request(url + '?point=' + b.id); assert.equal(preview.status, 200); assert.equal(preview.value.actions.length, 3);
+  const extra = make('d.md', 'late');
+  assert.equal((await f.request(url, 'POST', {point: b.id, fingerprint: preview.value.fingerprint})).status, 409);
+  assert.equal(f.store.history(paired.vaultId, a.fileId).length, 2);
+  const fresh = await f.request(url + '?point=' + b.id); assert.equal(fresh.value.actions.length, 4);
+  const done = await f.request(url, 'POST', {point: b.id, fingerprint: fresh.value.fingerprint}); assert.equal(done.status, 200);
+  const state = f.store.snapshot(paired.vaultId), head = (fileId: string) => state.files.find(x => x.fileId === fileId)!.heads[0];
+  assert.equal(head(a.fileId).hash, a.hash); assert.deepEqual(head(a.fileId).parents, [changed.id]);
+  assert.equal(head(b.fileId).hash, b.hash); assert.deepEqual(head(b.fileId).parents, [deleted.id]);
+  assert.equal(head(c.fileId).deleted, true); assert.equal(head(extra.fileId).deleted, true);
+  assert.equal(f.store.history(paired.vaultId, a.fileId).length, 3);
+  assert.equal(f.store.history(paired.vaultId, b.fileId).length, 3);
+  assert.equal((await f.request(url + '?point=' + b.id)).value.actions.length, 0);
+  const another = f.store.createVault('Another'); assert.equal((await f.request(`/admin/api/vaults/${another.id}/restore?point=${b.id}`)).status, 404);
+});
+
+test('interrupted whole-vault restore reports partial progress and a new preview safely finishes it', async t => {
+  const f = await setup(t); await f.login();
+  const device = f.store.pair(f.store.createPair('History').code, 'Device'), bytes = Buffer.from('x');
+  f.store.putObject(device.vaultId, hash(bytes), bytes);
+  const add = (path: string) => { const r = {id: id(), fileId: id(), parents: [], path, deleted: false, hash: hash(bytes), size: bytes.length, clientId: device.deviceId}; f.store.commit(device.vaultId, r, device.deviceId); return r; };
+  const point = add('keep.md'), x = add('x.md'), y = add('y.md'), url = `/admin/api/vaults/${device.vaultId}/restore`;
+  const plan = (await f.request(url + '?point=' + point.id)).value;
+  const commit = f.store.commit.bind(f.store); let calls = 0;
+  f.store.commit = (...args) => { if (++calls === 2) throw new Error('simulated database outage'); return commit(...args); };
+  const interrupted = await f.request(url, 'POST', {point: point.id, fingerprint: plan.fingerprint});
+  assert.equal(interrupted.status, 409); assert.equal(interrupted.value.code, 'restore_partial'); assert.match(interrupted.value.message, /1 个新版本/);
+  f.store.commit = commit;
+  const retry = (await f.request(url + '?point=' + point.id)).value; assert.equal(retry.actions.length, 1);
+  assert.equal((await f.request(url, 'POST', {point: point.id, fingerprint: retry.fingerprint})).status, 200);
+  const state = f.store.snapshot(device.vaultId);
+  assert.ok([x, y].every(r => state.files.find(file => file.fileId === r.fileId)!.heads[0].deleted));
+  assert.equal(f.store.history(device.vaultId, x.fileId).length, 2); assert.equal(f.store.history(device.vaultId, y.fileId).length, 2);
 });
 
 test('unconfigured admin stays closed while sync health and self-hosted login assets remain available', async t => {
