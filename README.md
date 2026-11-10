@@ -83,9 +83,9 @@ docker compose exec -T sync node dist/server/cli.cjs invite
 
 ## 验证结果
 
-本加固分支最近一次 Windows 本机检查：`npm.cmd test` 129 项，117 通过、0 失败、12 跳过；`npm.cmd run build` 通过。跳过的 11 项需要真实 CouchDB，另 1 项因本机创建符号链接返回 `EPERM`。**本加固分支的 CouchDB 行为未在真实 CouchDB 上验证。** 现有 SQLite 和模拟测试不能代替该验证。
+提交 `1df81c4` 的 Windows 本机检查：`npm.cmd test` 129 项，117 通过、0 失败、12 跳过；`npm.cmd run build` 通过。2026-11-10 在 Linux `huoying-ubuntu` 的独立 CouchDB 3.5.3 上运行：129 项、125 通过、0 失败、4 项 Windows 专属测试跳过；其中 11 项真实 CouchDB 用例全部通过，Linux 符号链接用例单独运行也通过。阶段 2 的部分故障注入、容量与协议测试仍只使用 SQLite／模拟环境，不能把以上结果视为所有后端或跨版本场景已验证。
 
-历史测试记录曾报告旧版本 Windows Obsidian、真实 CouchDB、Docker 镜像及远端 CI 验证；这些结果不能证明当前分支通过。macOS Obsidian GUI、用户实际 Rocky Linux/1Panel、跨机 HTTPS、长期运行及当前分支强杀恢复尚待验收。发布前逐项核对[验收清单](docs/RELEASE_CHECKLIST.md)。
+历史测试记录曾报告旧版本 Windows Obsidian、真实 CouchDB、Docker 镜像及远端 CI 验证；这些历史结果不能证明当前分支通过。当前分支的 macOS Obsidian GUI、实际 Rocky Linux/1Panel、跨机 HTTPS、长期运行、强杀恢复及生产跨版本升级尚待验收。发布前逐项核对[验收清单](docs/RELEASE_CHECKLIST.md)。
 
 详见[设计](docs/COUCHDB_DESIGN.md)、[部署与运维](docs/SERVER_QUICKSTART.md)、[测试记录](docs/COUCHDB_TEST_REPORT.md)。
 

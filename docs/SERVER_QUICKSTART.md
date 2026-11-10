@@ -1,6 +1,6 @@
 # LAN Note Sync 部署与运维
 
-本文适用于现行 LAN 路线。当前加固分支可构建，但**未在真实 CouchDB 上验证**，也未在实际 Rocky Linux / 1Panel、跨机 HTTPS 及 macOS Obsidian GUI 验收；投入实际使用前请完成[发布前验收清单](RELEASE_CHECKLIST.md)。下面是部署步骤，不代表已在目标环境执行。
+本文适用于现行 LAN 路线。提交 `1df81c4` 已在隔离 Linux 上通过 11 项真实 CouchDB 3.5.3 测试，但阶段 2 部分故障注入、容量与协议场景仍只在 SQLite／模拟环境测试；实际 Rocky Linux / 1Panel、跨机 HTTPS、macOS Obsidian GUI 和生产跨版本升级尚未验收。投入实际使用前请完成[发布前验收清单](RELEASE_CHECKLIST.md)。下面是部署步骤，不代表已在目标环境执行。
 
 1Panel / Rocky Linux 使用预构建镜像时，见 [GHCR 镜像部署指南](ONEPANEL_GHCR.md)。下面为源码构建部署，生产镜像部署不需要在服务器编译。
 
@@ -114,4 +114,4 @@ docker compose cp sync:/tmp/couch-export-new ./couch-export-new
 
 ## 当前验收范围
 
-当前为 0.5 试用路线，仅同步桌面端 Markdown，不含附件和端到端加密。旧版本曾在 Windows、真实 CouchDB 和 WSL 隔离 Docker 的 host-network 环境验证；这些历史记录不能证明当前加固分支通过。当前分支的 **真实 CouchDB 尚未验证**；macOS 实机、默认 bridge 网络、跨机 HTTPS、NAS 权限和长期运行仍需实际部署验收。旧记录见 `docs/COUCHDB_TEST_REPORT.md`，当前清单见 `docs/RELEASE_CHECKLIST.md`。
+当前为 0.5 试用路线，仅同步桌面端 Markdown，不含附件和端到端加密。旧版本曾在 Windows、真实 CouchDB 和 WSL 隔离 Docker 的 host-network 环境验证；这些历史记录不能证明当前加固分支通过。当前提交 `1df81c4` 的 11 项真实 CouchDB 测试已在隔离 Linux 通过，覆盖范围和剩余未验证项见 `docs/RELEASE_CHECKLIST.md`；macOS 实机、目标机默认 bridge 网络、跨机 HTTPS、NAS 权限和长期运行仍需实际验收。

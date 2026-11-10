@@ -29,12 +29,21 @@
 
 - Windows 本机 `npm.cmd test`：**129 项，117 通过、0 失败、12 跳过、0 取消**。11 项因未连接真实 CouchDB 而跳过；1 项符号链接测试实际尝试创建时返回 `EPERM` 而跳过。
 - `npm.cmd run build`：成功，退出码 0，未报告 warning。
-- 本加固分支的 **CouchDB 行为未在真实 CouchDB 上验证**。Linux 测试机 `huoying-ubuntu` 可通过 SSH 访问，但当次环境检查中 Node/npm 不在 PATH，账号无法直接访问 Docker socket，因此没有运行真实数据库测试，也没有创建测试容器。不得把历史版本 CI 结果当作当前分支结果。
+- Windows 本机的 11 项 CouchDB 测试当时跳过；随后已在独立 Linux 测试机运行，结果见下文。不能把旧版本 CI 或 SQLite／模拟测试当作当前分支真实 CouchDB 验证。
 - 测试范围与生产前待办见 [LAN 同步可靠性检查](LAN_HARDENING_RELIABILITY.md) 和 [发布前验收清单](RELEASE_CHECKLIST.md)。
+
+## Linux 真实 CouchDB 验证（2026-11-10）
+
+- 测试机 `huoying-ubuntu`，Ubuntu 24.04.4 LTS；Node.js 24.15.0，CouchDB 3.5.3；被测代码提交 `1df81c4`。
+- 使用仅绑定 `127.0.0.1:15984` 的独立容器及临时卷，`npm run test:couch`：**129 项，125 通过、0 失败、4 跳过**。4 项跳过是 Windows 专属测试；8 项真实 CouchDB 同步测试和 3 项 CouchDB 管理测试均实际执行并通过。
+- Linux 符号链接测试单独运行：**1 通过、0 失败、0 跳过**。完整套件也覆盖并通过该项；Windows 本机仍因 `EPERM` 跳过。
+- 容器、临时卷及测试凭据文件已清理；最终重复运行日志保留在测试机 `/home/tian/obsidian-sync-test/access-CUvpQ0JR/test-couch.log`。未操作生产服务、生产容器或生产数据库。
+- 上述结果只证明这 11 项真实 CouchDB 场景和本次 Linux 环境。阶段 2 新增的部分故障注入、容量统计及协议测试仍使用 SQLite 或模拟服务，不能据此宣称它们已在真实 CouchDB 上验证；也未验证生产的 0.3→0.5 跨版本升级。
+- 过程教训：首次默认镜像拉取触及宿主机 `docker.1panel.live` 镜像加速器，不符合无代理要求；后使用本机已有镜像并指定 `--pull=never`。以后遇到需要镜像源或拉取受阻，先报告，不擅自使用代理或镜像加速器。首次 `npm ci` 因用户和全局配置指向同一文件失败，之后改为两个独立配置文件成功；隔离环境应从一开始分开配置。
 
 ### 在隔离 Linux Docker 环境验证 CouchDB
 
-使用 Node.js 24.15.0、已安装项目依赖、可用 Docker daemon 的 Linux 测试机；确认本机 15984 端口空闲且能获取 `apache/couchdb:3.5.3` 镜像。下面的容器名和配置路径随机生成，仅监听回环地址；容器使用匿名卷，`--rm` 会在容器停止时清理匿名卷。密码只用于临时测试。以下步骤尚未在本机执行：
+使用 Node.js 24.15.0、已安装项目依赖、可用 Docker daemon 的 Linux 测试机；确认本机 15984 端口空闲、镜像已在本机且版本合适。不要擅自使用代理或镜像加速器；镜像缺失或拉取受阻时先报告。下面是独立复测示例，与上述实际运行使用的容器名、临时命名卷及已存在镜像不完全相同；容器名和配置路径随机生成，仅监听回环地址。容器使用匿名卷，`--rm` 会在容器停止时清理匿名卷。密码只用于临时测试：
 
 ```bash
 set -eu
@@ -46,7 +55,7 @@ cleanup() {
   rmdir "$test_dir"
 }
 trap cleanup EXIT
-container_id=$(docker run -d --rm --name "lan-couch-test-$(basename "$test_dir")" \
+container_id=$(docker run --pull=never -d --rm --name "lan-couch-test-$(basename "$test_dir")" \
   -p 127.0.0.1:15984:5984 -e COUCHDB_USER=ci_test_admin \
   -e COUCHDB_PASSWORD=ci-only-ephemeral-test-password \
   -v /opt/couchdb/data apache/couchdb:3.5.3)
