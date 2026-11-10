@@ -5,6 +5,7 @@ import { existsSync } from 'node:fs';
 import { Store } from '../server/store';
 import { hash, id, validatePath } from '../shared/protocol';
 import { fixture, revision, transport } from './helpers';
+import { checkRate } from '../server/http';
 
 test('pairing is single use, expires, is vault-scoped, and can be revoked', async t => {
   const f = await fixture(t);
@@ -18,6 +19,23 @@ test('pairing is single use, expires, is vault-scoped, and can be revoked', asyn
   assert.equal(cross.status, 403);
   f.store.db.prepare('UPDATE devices SET revoked=1 WHERE id=?').run(f.first.deviceId);
   await assert.rejects(f.remoteA.snapshot(), /撤销/);
+});
+test('unpaired devices are rejected and pairing attempts are rate limited despite forwarded headers', async t => {
+  const f = await fixture(t);
+  assert.equal((await transport(f.url + `/v1/vaults/${f.first.vaultId}/state`, 'GET', {})).status, 401);
+  for (let n = 0; n < 10; n++) {
+    const response = await transport(f.url + '/v1/pair', 'POST', {'Content-Type': 'application/json', 'X-Forwarded-For': `192.0.2.${n}`}, Buffer.from(JSON.stringify({code: 'a'.repeat(24), deviceName: 'unknown'})));
+    assert.equal(response.status, 401);
+  }
+  const limited = await transport(f.url + '/v1/pair', 'POST', {'Content-Type': 'application/json', 'X-Forwarded-For': '192.0.2.99'}, Buffer.from(JSON.stringify({code: 'b'.repeat(24), deviceName: 'unknown'})));
+  assert.equal(limited.status, 429);
+});
+test('rate limit buckets have a hard bound and expire without evicting active entries', () => {
+  const limits = new Map<string, {count: number; until: number}>();
+  for (let n = 0; n < 1000; n++) assert.equal(checkRate(limits, `${n}:pair`, 0), true);
+  assert.equal(checkRate(limits, 'new:pair', 1), false); assert.equal(limits.size, 1000);
+  assert.equal(checkRate(limits, '0:pair', 1), true);
+  assert.equal(checkRate(limits, 'new:pair', 60000), true); assert.equal(limits.size, 1);
 });
 test('binary objects preserve Chinese, BOM, CRLF and zero bytes; corrupt bytes rejected', async t => {
   const f = await fixture(t);

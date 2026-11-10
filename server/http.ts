@@ -22,6 +22,16 @@ async function readJson(req: IncomingMessage): Promise<any> {
   try { return JSON.parse((await body(req, 32 * 1024)).toString('utf8')); }
   catch (e) { if (e instanceof SyncError) throw e; throw new SyncError('invalid_json', 'JSON 无效', 400); }
 }
+export function checkRate(limits: Map<string, {count: number; until: number}>, key: string, now: number): boolean {
+  if (!limits.has(key) && limits.size >= 1000) {
+    for (const [name, bucket] of limits) if (bucket.until <= now) limits.delete(name);
+    if (limits.size >= 1000) return false;
+  }
+  const bucket = limits.get(key) ?? {count: 0, until: now + 60000};
+  if (bucket.until <= now) { bucket.count = 0; bucket.until = now + 60000; }
+  bucket.count++; limits.set(key, bucket);
+  return bucket.count <= (key.endsWith(':pair') ? 10 : 1200);
+}
 export function makeServer(store: Backend, tls?: ServerOptions, distribution?: Distribution, adminOptions?: AdminOptions) {
   const admin = new AdminController(store, adminOptions);
   const limits = new Map<string, { count: number; until: number }>();
@@ -30,12 +40,8 @@ export function makeServer(store: Backend, tls?: ServerOptions, distribution?: D
       const ip = req.socket.remoteAddress ?? 'unknown';
       const url = new URL(req.url ?? '/', 'http://localhost');
       const now = Date.now();
-      if (limits.size > 1000) for (const [k, v] of limits) if (v.until < now) limits.delete(k);
       const key = ip + (url.pathname === '/v1/pair' ? ':pair' : ':api');
-      const bucket = limits.get(key) ?? { count: 0, until: now + 60000 };
-      if (bucket.until < now) { bucket.count = 0; bucket.until = now + 60000; }
-      bucket.count++; limits.set(key, bucket);
-      if (bucket.count > (key.endsWith(':pair') ? 10 : 1200)) {
+      if (!checkRate(limits, key, now)) {
         res.setHeader('Retry-After', '60'); throw new SyncError('rate_limited', '请求过于频繁，请稍后重试', 429);
       }
       if (req.method === 'GET' && url.pathname === '/v1/health') { await store.health(); return json(res, 200, { ok: true, protocol: PROTOCOL, backend: store.kind }); }
