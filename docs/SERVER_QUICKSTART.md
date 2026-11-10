@@ -68,6 +68,10 @@ docker compose exec -T sync node dist/server/cli.cjs invite --new-vault --name "
 docker compose exec -T sync node dist/server/cli.cjs invite --vault <vault-id>
 ```
 
+## 运维注意事项
+
+`docker` 组通常可通过控制 Docker daemon 获得宿主机 root 权限；`NOPASSWD:ALL` 更允许账户无密码执行任意 root 命令。若可通过 SSH 私钥登录的账户拥有上述任一权限，任何取得该可用私钥并能登录的人都可能获得该机器的 root 权限。测试机 `huoying-ubuntu` 的 `tian` 账户已按用户要求同时启用这两项，属于明确接受的高权限取舍，不代表生产部署必须采用此配置。应妥善保管私钥，按实际需要限制账户权限，并在不再需要时由管理员评估撤销。
+
 ## 检查和设备管理
 
 ```text
