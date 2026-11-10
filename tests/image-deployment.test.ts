@@ -98,11 +98,16 @@ test('data-disk preparation rejects relative paths, filesystem root and an absen
   assert.equal(existsSync(join(root, 'configuration', '.env')), false);
 });
 
-test('data-disk preparation rejects symbolic-link directories and parents', { skip: !existsSync(bash) || process.platform === 'win32' }, t => {
+test('data-disk preparation rejects symbolic-link directories and parents', { skip: !existsSync(bash) }, t => {
   const root = bindRuntime(t), actual = join(root, 'actual'), link = join(root, 'linked');
-  mkdirSync(actual); symlinkSync(actual, link, 'dir');
+  mkdirSync(actual);
+  try { symlinkSync(actual, link, 'dir'); }
+  catch (error: any) {
+    if (['EPERM', 'EACCES', 'ENOSYS'].includes(error?.code)) { t.skip(`Cannot create test symlink: ${error.code}`); return; }
+    throw error;
+  }
   for (const data of [link, join(link, 'app')]) {
-    const result = prepare(['--data-dir', data, '--out', join(root, 'configuration')]); assert.notEqual(result.status, 0);
+    const result = prepare(['--data-dir', posix(data), '--out', posix(join(root, 'configuration'))]); assert.notEqual(result.status, 0);
   }
   assert.equal(existsSync(join(actual, 'app')), false);
 });
