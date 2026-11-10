@@ -65,6 +65,45 @@ test('lost successful commit response survives client restart and retains later 
   assert.equal(f.store.history(f.first.vaultId, Object.keys(restarted.engine.state.entries)[0]).length, 2);
   assert.equal((await f.remoteA.get(f.store.snapshot(f.first.vaultId).files[0].heads[0].hash!)).toString(), 'later');
 });
+
+test('repeated offline edits survive restart and follow the durable pending revision', async t => {
+  const f = await fixture(t); let offline = false;
+  const remote = new Remote(f.url, f.first.vaultId, f.first.token, async (...args) => {
+    if (offline && args[1] === 'PUT') throw new Error('offline');
+    return transport(...args);
+  });
+  const a = client(remote, f.store.serverId, f.first.deviceId);
+  a.local.set('note.md', 'base'); await a.engine.initialize(); await a.engine.sync();
+  a.local.set('note.md', 'queued'); offline = true;
+  await assert.rejects(a.engine.sync(), /offline/); assert.equal(a.saved.pending.length, 1);
+  const first = a.saved.pending[0].revision.id;
+  a.local.set('note.md', 'intermediate'); a.local.set('note.md', 'latest');
+  await assert.rejects(a.engine.sync(), /offline/); assert.equal(a.saved.pending[0].revision.id, first);
+  offline = false;
+  const restarted = client(f.remoteA, f.store.serverId, f.first.deviceId, a.local, a.saved);
+  await restarted.engine.sync(); await restarted.engine.sync();
+  const file = f.store.snapshot(f.first.vaultId).files[0], history = f.store.history(f.first.vaultId, file.fileId);
+  const queued = history.find(item => item.revision.id === first)!.revision;
+  const latest = history.find(item => item.revision.hash === hash(Buffer.from('latest')))!.revision;
+  assert.equal(queued.hash, hash(Buffer.from('queued'))); assert.deepEqual(latest.parents, [queued.id]);
+  assert.equal((await f.remoteA.get(latest.hash!)).toString(), 'latest'); assert.equal(restarted.saved.pending.length, 0);
+});
+
+test('failure after object upload retains the pending revision and retries without a duplicate commit', async t => {
+  const f = await fixture(t); let fail = true;
+  const remote = new Remote(f.url, f.first.vaultId, f.first.token, async (...args) => {
+    if (fail && args[0].endsWith('/commits')) { fail = false; throw new Error('injected interruption before commit'); }
+    return transport(...args);
+  });
+  const a = client(remote, f.store.serverId, f.first.deviceId); a.local.set('note.md', 'bytes');
+  await a.engine.initialize(); await assert.rejects(a.engine.sync(), /injected interruption/);
+  const pending = a.saved.pending[0].revision; assert.equal(f.store.snapshot(f.first.vaultId).files.length, 0);
+  const restarted = client(f.remoteA, f.store.serverId, f.first.deviceId, a.local, a.saved);
+  await restarted.engine.sync();
+  const file = f.store.snapshot(f.first.vaultId).files[0];
+  assert.equal(file.heads[0].id, pending.id); assert.equal(f.store.history(f.first.vaultId, file.fileId).length, 1);
+  assert.equal(restarted.saved.pending.length, 0); assert.equal(restarted.saved.entries[file.fileId].baseRevision, pending.id);
+});
 test('resolution response loss does not upload the discarded local version after restart', async t => {
   const { f, a, b } = await clients(t);
   a.local.set('note.md', 'remote'); await a.engine.initialize(); await a.engine.sync();
