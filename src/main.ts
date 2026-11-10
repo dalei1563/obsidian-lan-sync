@@ -13,6 +13,7 @@ import { normalizeExclusions } from '../shared/exclusions';
 import { DeadlineError, SingleFlight, withDeadline } from './sync/async-flow';
 import type { OverwriteMode } from './sync/overwrite-plan';
 import { updatePlugin } from './sync/updater';
+import { storageGrowth, storageReport, storageWarnings } from './sync/storage-report';
 
 export default class LanSyncPlugin extends Plugin {
   settings: LanSettings = { ...DEFAULT_SETTINGS, excludedPaths: [] };
@@ -34,6 +35,7 @@ export default class LanSyncPlugin extends Plugin {
   private readonly previewFlow = new SingleFlight();
   private readonly updateFlow = new SingleFlight();
   private previewDialog?: Modal;
+  private storageChecking = false;
   private readonly workflowDialogs = new Set<Modal>();
   get connecting(): boolean { return this.connectionFlow.busy; }
   get previewing(): boolean { return this.previewFlow.busy; }
@@ -86,6 +88,7 @@ export default class LanSyncPlugin extends Plugin {
     }));
     this.registerInterval(window.setInterval(() => { if (this.settings.enabled && Date.now() >= this.nextAttempt) void this.sync(false, true); }, 5000));
     this.registerInterval(window.setInterval(() => { if (this.settings.autoUpdate && this.settings.vaultId) void this.checkUpdate(false).catch(() => {}); }, 6 * 60 * 60 * 1000));
+    this.registerInterval(window.setInterval(() => { if (this.settings.storageLimitMiB > 0 && this.engine && this.disk && this.local) void this.checkStorage(false).catch(() => this.setStatus('容量检查失败，请打开设置重试')); }, 6 * 60 * 60 * 1000));
     this.registerEvent(this.app.workspace.on('active-leaf-change', changed));
     this.app.workspace.onLayoutReady(() => { void this.action(async () => {
       if (!this.settings.vaultId) {
@@ -95,6 +98,7 @@ export default class LanSyncPlugin extends Plugin {
       await this.setup();
       if (this.settings.enabled) await this.sync(false);
       if (this.settings.autoUpdate && this.settings.vaultId) void this.checkUpdate(false).catch(() => {});
+      if (this.settings.storageLimitMiB > 0 && this.engine && this.disk && this.local) void this.checkStorage(false).catch(() => this.setStatus('容量检查失败，请打开设置重试'));
     }); });
   }
   onunload(): void {
@@ -113,6 +117,41 @@ export default class LanSyncPlugin extends Plugin {
   private ensureActive(): void { if (this.disposed) throw new Error('插件已卸载，请重新启用后重试'); }
   private refreshSettings(): void { if (!this.disposed) this.settingsTab?.refreshBinding(); }
   saveSettings(): Promise<void> { return this.saveData(this.settings); }
+  private async checkStorage(show: boolean): Promise<void> {
+    if (this.storageChecking) { if (show) throw new Error('容量检查正在进行，请稍后重试'); return; }
+    const engine = this.engine, disk = this.disk, local = this.local;
+    if (!engine || !disk || !local) throw new Error('请先连接同步服务');
+    this.storageChecking = true;
+    try {
+      const report = await storageReport(engine.remote, engine.state, join(disk.directory, 'snapshots'), join(local.root, '.trash'));
+      this.ensureActive();
+      const now = Date.now(), growth = storageGrowth(this.settings.storageSample ?? undefined, report, now);
+      this.settings.storageSample = {at: now, report}; await this.saveSettings();
+      const labels = {history: '服务端历史及当前正文（去重逻辑大小）', snapshots: '本机恢复快照', pending: '待上传正文', trash: 'Vault 内 .trash'};
+      const format = (bytes: number) => (bytes / 1048576).toFixed(2) + ' MiB';
+      const keys = Object.keys(labels) as (keyof typeof labels)[];
+      const warnings = storageWarnings(report, this.settings.storageLimitMiB);
+      if (warnings.length) new Notice('容量超过阈值：' + warnings.map(key => labels[key]).join('、'), 10000);
+      if (show) {
+        const modal = new Modal(this.app); modal.titleEl.setText('同步容量');
+        modal.contentEl.createEl('pre', {text: keys.map(key => `${labels[key]}：${format(report[key])}${growth ? `；变化 ${format(growth[key])}/天` : '；首次统计暂无增长速度'}`).join('\n')});
+        modal.contentEl.createEl('p', {text: '历史为已引用正文去重后的逻辑量，不含数据库索引、碎片和孤立对象，不能代表服务器实际磁盘占用；回收站仅统计 Vault 内 .trash，不含系统回收站。增长速度是两次采样间平均值。'});
+        modal.open();
+      }
+    } finally { this.storageChecking = false; }
+  }
+  showStorage(): Promise<void> { return this.checkStorage(true); }
+  async previewSnapshotCleanup(): Promise<void> {
+    const disk = this.disk; if (!disk) throw new Error('请先连接同步服务');
+    const plan = disk.previewSnapshotCleanup(), modal = new Modal(this.app);
+    modal.titleEl.setText('确认清理本机恢复快照');
+    modal.contentEl.createEl('p', {text: `将永久删除 ${plan.files.length} 个本机恢复快照，共 ${(plan.files.reduce((n, file) => n + file.size, 0) / 1048576).toFixed(2)} MiB。删除后不能从此目录恢复；请先确认已有备份。不会清理待上传队列、笔记、回收站或服务端历史。`});
+    modal.contentEl.createEl('pre', {text: plan.files.map(file => `${file.name}  ${file.size} 字节`).join('\n') || '没有可清理的快照。'});
+    new Setting(modal.contentEl).addButton(b => b.setButtonText('取消').onClick(() => modal.close())).addButton(b => b.setButtonText('确认永久删除').setWarning().setDisabled(!plan.files.length).onClick(() => {
+      b.setDisabled(true); void this.action(async () => { const count = disk.cleanupSnapshots(plan.fingerprint); modal.close(); new Notice(`已清理 ${count} 个本机恢复快照`); }).finally((): void => { if (!this.disposed) b.setDisabled(false); });
+    }));
+    modal.open();
+  }
   checkUpdate(manual: boolean): Promise<void> {
     return this.updateFlow.run('plugin-update', async () => {
       this.ensureActive();

@@ -301,6 +301,20 @@ test('cloud overwrite does not begin until the user confirms their own backup', 
   });
 });
 
+test('snapshot cleanup only runs after explicit confirmation', () => {
+  isolatedUi(async (fixture, check: typeof assert) => {
+    const f = fixture(async () => { throw new Error('unexpected request'); }); let removed = 0;
+    f.plugin.disk = {previewSnapshotCleanup: () => ({files: [{name: 'saved.md', size: 7}], fingerprint: 'preview'}),
+      cleanupSnapshots: (fingerprint: string) => { check.equal(fingerprint, 'preview'); removed++; return 1; }};
+    await f.plugin.previewSnapshotCleanup(); check.equal(removed, 0);
+    f.modals[0].contentEl.buttons.find((b: any) => b.text === '取消').click(); check.equal(removed, 0);
+    await f.plugin.previewSnapshotCleanup();
+    const button = f.modals[1].contentEl.buttons.find((b: any) => b.text === '确认永久删除');
+    button.click(); await new Promise<void>(resolve => setImmediate(resolve));
+    check.equal(removed, 1); check.equal(button.thenCalls, 0);
+  });
+});
+
 test('conflict confirmation restores SDK thenable buttons after both successful and failed resolution', () => {
   isolatedUi(async (fixture, check: typeof assert) => {
     for (const fail of [false, true]) {

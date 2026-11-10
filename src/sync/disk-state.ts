@@ -1,4 +1,4 @@
-import { mkdirSync, existsSync, readFileSync, openSync, writeFileSync, fsyncSync, closeSync, renameSync, lstatSync, unlinkSync } from 'node:fs';
+import { mkdirSync, existsSync, readFileSync, openSync, writeFileSync, fsyncSync, closeSync, renameSync, lstatSync, unlinkSync, readdirSync } from 'node:fs';
 import { join, resolve, dirname } from 'node:path';
 import { hash, id, validCursor } from '../../shared/protocol';
 import type { SyncState } from './engine';
@@ -52,6 +52,30 @@ export class DiskState {
     const target = join(this.directory, 'snapshots', hash(data) + '.md');
     if (!existsSync(target)) this.atomic(target, data);
     else if (hash(readFileSync(target)) !== hash(data)) throw new Error('恢复快照损坏，请检查磁盘');
+  }
+  previewSnapshotCleanup(): { files: {name: string; size: number}[]; fingerprint: string } {
+    const directory = join(this.directory, 'snapshots');
+    if (lstatSync(directory).isSymbolicLink()) throw new Error('恢复快照目录不能是链接');
+    const files = readdirSync(directory).sort().map(name => {
+      if (!/^[a-f0-9]{64}\.md$/.test(name)) throw new Error('快照目录包含未知文件，已停止清理');
+      const file = join(directory, name), stat = lstatSync(file);
+      if (!stat.isFile() || stat.isSymbolicLink() || hash(readFileSync(file)) !== name.slice(0, 64)) throw new Error('快照目录包含无效或损坏文件，已停止清理');
+      return {name, size: stat.size};
+    });
+    return {files, fingerprint: hash(JSON.stringify(files))};
+  }
+  cleanupSnapshots(fingerprint: string): number {
+    const plan = this.previewSnapshotCleanup();
+    if (plan.fingerprint !== fingerprint) throw new Error('快照已变化，请重新预览清理');
+    let removed = 0;
+    try {
+      for (const item of plan.files) {
+        const path = join(this.directory, 'snapshots', item.name), stat = lstatSync(path);
+        if (!stat.isFile() || stat.isSymbolicLink() || hash(readFileSync(path)) !== item.name.slice(0, 64)) throw new Error('快照已变化');
+        unlinkSync(path); removed++;
+      }
+    } catch { throw new Error(`清理已停止，已删除 ${removed} 个快照；请重新预览后检查`); }
+    return removed;
   }
   close(): void {
     const lock = join(this.directory, 'state.lock');

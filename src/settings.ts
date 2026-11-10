@@ -1,16 +1,18 @@
-import { App, PluginSettingTab, Setting } from 'obsidian';
+import { App, Notice, PluginSettingTab, Setting } from 'obsidian';
 import type LanSyncPlugin from './main';
 import { normalizeExclusions } from '../shared/exclusions';
+import type { StorageReport } from './sync/storage-report';
 
 export interface LanSettings {
   server: string; allowHttp: boolean; enabled: boolean; vaultId: string;
   vaultName: string; deviceId: string; serverId: string; secretId: string;
   excludedPaths: string[]; autoUpdate: boolean;
+  storageLimitMiB: number; storageSample: {at: number; report: StorageReport} | null;
 }
 export const DEFAULT_SETTINGS: LanSettings = {
   server: 'http://127.0.0.1:27123', allowHttp: false, enabled: false,
   vaultId: '', vaultName: '', deviceId: '', serverId: '', secretId: '',
-  excludedPaths: [], autoUpdate: true,
+  excludedPaths: [], autoUpdate: true, storageLimitMiB: 1024, storageSample: null,
 };
 export class LanSettingTab extends PluginSettingTab {
   private connectionDraft = '';
@@ -65,6 +67,17 @@ export class LanSettingTab extends PluginSettingTab {
       new Setting(details).addButton(b => b.setButtonText('检查连接').onClick(() => void plugin.action(async () => { await plugin.diagnose(); this.display(); })));
     }
     if (plugin.disk) details.createEl('code', { text: plugin.disk.directory + '/snapshots' });
+    if (plugin.disk && plugin.engine) {
+      let limit = String(plugin.settings.storageLimitMiB);
+      new Setting(details).setName('容量告警阈值（MiB）').setDesc('任一统计项达到此值时提示；0 表示关闭告警，不会自动清理。').addTextArea(t => {
+        t.setValue(limit).onChange(value => { limit = value; }); t.inputEl.rows = 1;
+      });
+      new Setting(details).addButton(b => b.setButtonText('保存阈值').onClick(() => void plugin.action(async () => {
+        const value = Number(limit); if (!Number.isFinite(value) || value < 0 || value > 10000000) throw new Error('请输入有效的非负容量阈值');
+        plugin.settings.storageLimitMiB = value; await plugin.saveSettings(); new Notice('容量告警阈值已保存');
+      }))).addButton(b => b.setButtonText('查看容量').onClick(() => void plugin.action(() => plugin.showStorage())));
+      new Setting(details).setName('清理本机恢复快照').setDesc('只清理本插件保存的恢复副本；预览和确认后永久删除，无法从本机恢复。').addButton(b => b.setButtonText('预览清理').onClick(() => void plugin.action(() => plugin.previewSnapshotCleanup())));
+    }
     details.createEl('p', { text: '凭证保存在 Obsidian 密钥存储中。不要删除同步状态来修复连接，也不要同时对这个 Vault 启用其他同步插件。' });
   }
 }
