@@ -1,5 +1,9 @@
 # LAN Note Sync 0.5：CouchDB + 独立 Obsidian 插件
 
+**项目路线：只开发自建 LAN Note Sync。原飞书云盘／多维表格方案已于 2026-11-10 废弃；原 SPEC 仅作历史归档，不是后续需求或验收依据。** 现行设计见 [LAN 同步设计](docs/LAN_SYNC_DESIGN.md) 与 [CouchDB 设计](docs/COUCHDB_DESIGN.md)。
+
+原 SPEC 在本工作区中被 Git 忽略且未跟踪，已在本地文件顶部标注废弃；它不随仓库提交或构建包分发。
+
 目标是把配置留在服务端：管理员部署一次，Windows 和 macOS 用户运行一条安装命令、选择笔记库，在 Obsidian 中启用插件并确认首次同步。
 
 这是一套独立实现，不依赖或派生自 Self-hosted LiveSync。CouchDB 负责持久化，插件和网关使用本项目自己的同步协议。当前是可试用版本，尚未完成 macOS 实机和长期运行验收。
@@ -71,15 +75,17 @@ docker compose exec -T sync node dist/server/cli.cjs invite
 
 首版仅面向 Windows/macOS 桌面端 **Markdown**；不含图片/PDF 等附件、移动端、配置同步、端到端加密、自动服务器迁移或多网关高可用。每个文件最大 5 MiB，每库最多 10,000 个逻辑文件（包括已删除文件身份）；历史和快照不自动清理。
 
+插件提供容量采样和可配置告警，也可在预览、明确确认后清理本机恢复快照。该清理不可从原目录撤销，可能删除尚未提交内容的唯一恢复副本；先确认独立备份。历史容量是已引用正文的去重逻辑估算，不能代替服务器物理磁盘监测；回收站统计不含系统回收站。详见[保留策略](docs/RETENTION_POLICY.md)。
+
 插件不直连 CouchDB。结构为：`Obsidian 插件 → HTTP(S) 网关 → CouchDB`。客户端不接触 CouchDB 管理员密码，也不需要配置 CouchDB CORS。Compose 只发布网关端口，数据库留在内部网络。
 
 运行时固定 Node.js 24.15.0、CouchDB 3.5.3；Obsidian 最低 1.11.4。网关使用 TypeScript + Node 原生 HTTP；没有额外 Web 框架。CouchDB 是持久化底座，文件应用、冲突和断线恢复仍由本项目实现和验证。
 
 ## 验证结果
 
-自动化测试包含真实 CouchDB、Windows PowerShell 和 Bash 安装器、覆盖及历史恢复。Windows Obsidian 1.12.7 已验证自动接入、首次预览、同步和设置界面。
+本加固分支最近一次 Windows 本机检查：`npm.cmd test` 129 项，117 通过、0 失败、12 跳过；`npm.cmd run build` 通过。跳过的 11 项需要真实 CouchDB，另 1 项因本机创建符号链接返回 `EPERM`。**本加固分支的 CouchDB 行为未在真实 CouchDB 上验证。** 现有 SQLite 和模拟测试不能代替该验证。
 
-两个生产 Docker 镜像已实际构建并运行，通过强制终止网关再启动后的身份、正文及历史保留验证。当前 Docker 集成环境使用 WSL 隔离守护进程和 host-network 测试覆盖；用户实际 Rocky Linux/1Panel 尚未验收。GHCR 双架构发布及 Windows/macOS/真实 CouchDB 远端 CI 已通过；macOS 安装脚本已在原生 CI 执行，但 macOS Obsidian GUI 尚未实机验收。
+历史测试记录曾报告旧版本 Windows Obsidian、真实 CouchDB、Docker 镜像及远端 CI 验证；这些结果不能证明当前分支通过。macOS Obsidian GUI、用户实际 Rocky Linux/1Panel、跨机 HTTPS、长期运行及当前分支强杀恢复尚待验收。发布前逐项核对[验收清单](docs/RELEASE_CHECKLIST.md)。
 
 详见[设计](docs/COUCHDB_DESIGN.md)、[部署与运维](docs/SERVER_QUICKSTART.md)、[测试记录](docs/COUCHDB_TEST_REPORT.md)。
 
@@ -94,5 +100,7 @@ npm test
 真实 CouchDB 集成测试需要先在 `.test-runtime/couch-test.json` 配置专用测试数据库的 `{url,user,password}`，再执行 `npm run test:couch`。不要使用生产数据库凭证或生产数据库。测试创建随机数据库并清理。
 
 默认后端是 CouchDB。旧 SQLite 后端仅保留为显式 `SYNC_BACKEND=sqlite` 的开发/旧版本兼容路径；没有从 v0.2 数据库到 CouchDB 的自动迁移。旧版文档为归档，不再作为当前部署指南。
+
+`src/feishu/auth.ts` 和 `tests/auth.test.cjs` 是已废弃的飞书 POC 鉴权探针及其独立模拟测试，保留作历史参考。它们不被 `src/main.ts` 或 LAN 运行时引用，探针不打入插件包，也不属于默认 `npm test`；TypeScript 检查仍包含 `src/feishu/auth.ts`。不要把该探针用于正式接入或据此判断飞书同步已实现。
 
 不要删除 `data.json` / `local-state` 来修复连接，也不要把插件状态复制到第二台设备。先用测试笔记库验证，正式切换时保留原库和服务数据，并停止同一目录的其他同步工具。

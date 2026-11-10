@@ -2,7 +2,7 @@
 
 日期：2026-11-10；分支：`chore/lan-hardening`；基线提交：`c330206`。
 
-路线：仅继续 LAN Note Sync；飞书云盘及多维表格方案已废弃。路线及原文档的正式标注将在文档阶段处理。
+路线：仅继续 LAN Note Sync；飞书云盘及多维表格方案已废弃。本工作区原 SPEC 已标注为历史归档；该文件原本被 Git 忽略且未跟踪，未强制加入仓库。
 
 ## 本机检查
 
@@ -23,7 +23,14 @@
 - `npm.cmd test`：111 项，99 通过、0 失败、12 跳过；`npm.cmd run build` 成功且未报告 warning。
 - `docker version`：找不到 Docker 命令，默认 Docker Desktop CLI 路径也不存在，因此未创建容器、未运行真实 CouchDB 测试。本机 WSL 状态查询返回访问被拒绝，不能证明其内部是否安装 Docker。
 - 11 项 CouchDB 测试因未提供 `COUCH_TEST_CONFIG` 而跳过。它们会创建并删除随机的 `lnstest_...` 数据库，必须仅连接专用测试实例，不使用生产凭据。
-- 符号链接测试在 `tests/image-deployment.test.ts` 中对所有 Windows 无条件跳过；这不是一次权限检测结果，也不能仅通过开启开发者模式使其运行。可在有 Bash 和创建符号链接权限的 Linux 环境运行验证。
+- 阶段 1 时符号链接测试对所有 Windows 无条件跳过；阶段 2 已改为先尝试创建链接，见下方最终结果。
+
+## 阶段 2 最终结果
+
+- Windows 本机 `npm.cmd test`：**129 项，117 通过、0 失败、12 跳过、0 取消**。11 项因未连接真实 CouchDB 而跳过；1 项符号链接测试实际尝试创建时返回 `EPERM` 而跳过。
+- `npm.cmd run build`：成功，退出码 0，未报告 warning。
+- 本加固分支的 **CouchDB 行为未在真实 CouchDB 上验证**。Linux 测试机 `huoying-ubuntu` 可通过 SSH 访问，但当次环境检查中 Node/npm 不在 PATH，账号无法直接访问 Docker socket，因此没有运行真实数据库测试，也没有创建测试容器。不得把历史版本 CI 结果当作当前分支结果。
+- 测试范围与生产前待办见 [LAN 同步可靠性检查](LAN_HARDENING_RELIABILITY.md) 和 [发布前验收清单](RELEASE_CHECKLIST.md)。
 
 ### 在隔离 Linux Docker 环境验证 CouchDB
 

@@ -1,5 +1,7 @@
 # Rocky Linux / 1Panel：使用 GHCR 镜像部署
 
+当前加固分支尚未在目标 Rocky Linux / 1Panel 或真实 CouchDB 上验证。下列 0.5.0 镜像名是部署配置示例；使用前须核实对应镜像已发布、与所需源码提交匹配且通过验收，不能从本地构建成功推断远端镜像已更新。执行前备份并参考[发布前验收清单](RELEASE_CHECKLIST.md)。
+
 ## 发布状态
 
 历史记录（2026-11-09）：两个 0.4.2 镜像已发布，支持 linux/amd64 和 linux/arm64；修复首次同步完成后按钮回调引发的界面卡死，包含单密码管理台、多仓库、设备管理和排除规则。源码仓库为 [dalei1563/obsidian-lan-sync](https://github.com/dalei1563/obsidian-lan-sync)。使用说明见[管理台指南](ADMIN_GUIDE.md)。
@@ -103,6 +105,8 @@ node dist/server/cli.cjs invite --url http://192.168.1.10:27123
 
 局域网 HTTP 不需要反向代理。选择 HTTPS 部署时，可把 `.env` 中 `SYNC_LISTEN_ADDRESS` 设为 `127.0.0.1`，由宿主机代理转发。域名配置 HTTPS，并把整个根路径转发给网关，包括 `/v1/` 和安装资源路径，允许至少 5 MiB 请求体及 30 秒处理时间。
 
+还应转发 `/admin/`、保留 `Authorization` 头，并将管理员生成的连接码设为设备可访问的 HTTPS 根地址；管理台经 HTTPS 使用时设置 `SYNC_ADMIN_SECURE_COOKIE=true`，重建网关后从另一台设备验证证书、登录、安装和双向同步。该跨机 HTTPS 场景尚未在当前分支验收。
+
 **如果 1Panel OpenResty 运行在容器中，代理目标 127.0.0.1 指向 OpenResty 自己。** 应把 sync 和 OpenResty 接入同一个用户定义 Docker 网络，给 sync 设置唯一网络别名（如 `lan-note-sync-gateway`），再代理到 `http://lan-note-sync-gateway:27123`。网络名称需根据服务器实际配置确认，不假定一定叫 `1panel-network`。CouchDB 继续只接入应用内部网络。
 
 未指定 `--data-dir` 时使用命名卷；指定后使用带 `:Z` 标签的绑定目录。默认不要求关闭 SELinux。可信 LAN 直接访问需要明确开放监听，并由管理员在 1Panel/主机防火墙配置相应端口；正式公网使用 HTTPS 入口。
@@ -132,6 +136,8 @@ docker compose up -d --no-deps sync
 ```
 
 不默认跟随 latest，不自动重置凭证、不删除数据卷。旧镜像回退是否可行取决于数据格式兼容性，需要结合备份验证。
+
+回滚时先暂停写入、保存当前数据和故障日志，再在隔离环境检查旧镜像对当前数据及客户端协议的兼容性。若须恢复升级前备份，应成对恢复 CouchDB、gateway 和 `.env` 到隔离位置；备份之后的写入不会自动包含在旧备份中，切回前须单独保存和核对。具体验证及限制见[部署与运维](SERVER_QUICKSTART.md#回滚)。
 
 后端镜像包含对应的 Obsidian 插件、ZIP 和安装脚本。旧版 0.4 客户端首次升级到 0.5 时，关闭 Obsidian 后直接运行后台提供的安装命令，无需追加 upgrade 参数；安装器会保留连接和同步状态。0.5 插件默认自动从已连接的服务下载后续更新，重启 Obsidian 后生效。
 

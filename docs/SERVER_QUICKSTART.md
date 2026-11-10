@@ -1,4 +1,6 @@
-# LAN Note Sync 0.3 部署与运维
+# LAN Note Sync 部署与运维
+
+本文适用于现行 LAN 路线。当前加固分支可构建，但**未在真实 CouchDB 上验证**，也未在实际 Rocky Linux / 1Panel、跨机 HTTPS 及 macOS Obsidian GUI 验收；投入实际使用前请完成[发布前验收清单](RELEASE_CHECKLIST.md)。下面是部署步骤，不代表已在目标环境执行。
 
 1Panel / Rocky Linux 使用预构建镜像时，见 [GHCR 镜像部署指南](ONEPANEL_GHCR.md)。下面为源码构建部署，生产镜像部署不需要在服务器编译。
 
@@ -30,7 +32,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\deployment\setup.ps1 -Publ
 bash deployment/setup.sh --public-url http://192.168.1.10:27123 --expose-lan
 ```
 
-此模式使用 HTTP，客户端首次接入会提示明文传输。正式使用建议部署可信 HTTPS 反向代理，保持网关回环绑定，原样转发服务根路径下所有路由（`/v1/`、`/install/`、`/install.ps1`、`/install.sh`）。代理应允许至少 5 MiB 请求、30 秒处理时间，并保持 Authorization 请求头。TLS 终止在代理上，CouchDB 不向客户端开放。
+此模式使用 HTTP，客户端首次接入会提示明文传输。正式使用建议部署可信 HTTPS 反向代理，保持网关回环绑定，原样转发服务根路径下所有路由（包括 `/v1/`、`/install/`、`/install.ps1`、`/install.sh` 和 `/admin/`）。代理应允许至少 5 MiB 请求、30 秒处理时间，并保持 Authorization 请求头。TLS 终止在代理上，CouchDB 不向客户端开放。向设备提供可访问的 HTTPS 根地址；管理台经 HTTPS 使用时将 `.env` 的 `SYNC_ADMIN_SECURE_COOKIE` 设为 `true`，更改后重新创建网关。证书、DNS、反向代理及防火墙需按实际环境配置，本项目不自动配置。
 
 已有 `.env` 时 setup 不会覆盖任何配置，也不会应用新的 PublicUrl/ExposeLan 参数。需要改地址时，编辑其中 `SYNC_PUBLIC_URL`（设备可达的根 HTTP(S) URL，不含子路径）和 `SYNC_LISTEN_ADDRESS`（`127.0.0.1` 或 `0.0.0.0`），然后执行：
 
@@ -81,9 +83,13 @@ docker compose exec -T sync node dist/server/cli.cjs revoke --device <device-id>
 
 ## 更新
 
-服务端：保留 `.env` 和两个命名卷，将新源码包解压到新的目录并复制原 `.env`，确认 Compose 项目名仍是 `lan-note-sync-couch`，执行 `docker compose up -d --build --wait`。更新前备份。不要同时启动两个网关副本连接同一数据库，也不要同时运行两个不同版本的同步插件。
+服务端：更新前记录当前镜像或源码版本、Compose 项目名和数据位置，停止服务并对 CouchDB、gateway 数据及 `.env` 做一致备份。源码部署将新源码包解压到新目录并复制原 `.env`，核对项目名仍是 `lan-note-sync-couch` 和原卷映射，再在新目录执行 `docker compose up -d --build --wait`。镜像部署按 [1Panel 指南](ONEPANEL_GHCR.md) 使用已验证的固定版本。不要同时启动两个网关副本连接同一数据库，也不要同时运行两个不同版本的同步插件。更新后检查两个服务健康、协议版本、测试 Vault 的双向同步和历史恢复。
 
-客户端：关闭 Obsidian，获取新邀请的安装命令，在 Windows 末尾追加 `-Upgrade`，macOS 末尾追加 `--upgrade`。升级模式保留现有连接和本地状态，新邀请不会改变原绑定；旧目录保留为带随机后缀的备份。没有这些显式参数时，安装器拒绝覆盖已有插件。首次试用建议先在复制的笔记库中验证升级。
+客户端：从 0.4 首次升级至 0.5 时，先关闭 Obsidian，使用后台提供的对应系统安装命令，选择原 Vault；当前安装器不要求追加 `-Upgrade` / `--upgrade`。已绑定时安装器保留原连接与本地状态，并将旧插件目录留在 Vault 配置目录下的 `lan-note-sync-backups`。0.5 以后插件默认从已连接服务下载更新，重启 Obsidian 生效；也可在设置中手动检查。升级前保留独立备份，先在测试 Vault 验证。
+
+## 回滚
+
+回滚前停止新写入并保存当前故障现场和完整数据备份，不直接删除状态或覆盖原数据。先在隔离环境检查旧服务／插件是否支持当前数据和协议：兼容时，可将服务镜像或源码固定回记录的版本，并恢复对应配置；若数据格式不兼容，需在隔离环境成对恢复升级前的 CouchDB、gateway 及 `.env` 一致备份。恢复旧备份会丢失备份之后的服务端变更，必须先保存并核对这些变更，不能静默覆盖。客户端可在关闭 Obsidian 后检查安装器或自动更新保留的备份，但旧插件是否能读取当前本地状态必须先验证；不要把其他设备的状态复制过来。先完成测试 Vault 的历史、凭证和双向同步验证，再决定是否切回实际环境。当前没有自动回滚或数据库导入工具。
 
 ## 持久化和备份
 
@@ -108,4 +114,4 @@ docker compose cp sync:/tmp/couch-export-new ./couch-export-new
 
 ## 当前验收范围
 
-当前为 0.3 试用版，仅同步桌面端 Markdown，不含附件和端到端加密。Windows 实机与真实 CouchDB 自动化已验证；两个生产镜像在 WSL 隔离 Docker 上使用 host-network 测试覆盖完成运行、持久化和强制重启验证。macOS 实机、默认 bridge 网络、跨机 HTTPS、NAS 权限和长期运行仍需实际部署验收。完整记录见 `docs/COUCHDB_TEST_REPORT.md`。
+当前为 0.5 试用路线，仅同步桌面端 Markdown，不含附件和端到端加密。旧版本曾在 Windows、真实 CouchDB 和 WSL 隔离 Docker 的 host-network 环境验证；这些历史记录不能证明当前加固分支通过。当前分支的 **真实 CouchDB 尚未验证**；macOS 实机、默认 bridge 网络、跨机 HTTPS、NAS 权限和长期运行仍需实际部署验收。旧记录见 `docs/COUCHDB_TEST_REPORT.md`，当前清单见 `docs/RELEASE_CHECKLIST.md`。
