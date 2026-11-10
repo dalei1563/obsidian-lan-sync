@@ -126,6 +126,18 @@ test('a local edit during download is never overwritten', async t => {
   b.local.beforeApply = () => b.local.set('note.md', 'edit during download');
   await b.engine.sync(); assert.equal(b.local.text('note.md'), 'edit during download'); assert.ok(Object.keys(b.engine.state.issues).length);
 });
+
+test('a locked local file reports an issue and applies the remote version after retry', async t => {
+  const {a, b} = await clients(t);
+  a.local.set('note.md', 'base'); await a.engine.initialize(); await a.engine.sync(); await b.engine.initialize(); await b.engine.sync();
+  a.local.set('note.md', 'remote'); await a.engine.sync();
+  const apply = b.local.apply.bind(b.local); let locked = true;
+  b.local.apply = async request => { if (locked) throw new Error('文件被占用，请关闭占用程序'); await apply(request); };
+  await b.engine.sync(); assert.equal(b.local.text('note.md'), 'base');
+  assert.match(Object.values(b.engine.state.issues).join(), /文件被占用/);
+  locked = false; await b.engine.sync(); assert.equal(b.local.text('note.md'), 'remote');
+  assert.equal(Object.keys(b.engine.state.issues).length, 0);
+});
 test('local persistence failure prevents network publication', async t => {
   const { f, a } = await clients(t);
   a.local.set('note.md', 'local'); await a.engine.initialize(); a.failSave = s => s.pending.length > 0;

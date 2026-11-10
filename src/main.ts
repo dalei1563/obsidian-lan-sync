@@ -36,6 +36,7 @@ export default class LanSyncPlugin extends Plugin {
   private readonly updateFlow = new SingleFlight();
   private previewDialog?: Modal;
   private storageChecking = false;
+  private updateFailureNotified = false;
   private readonly workflowDialogs = new Set<Modal>();
   get connecting(): boolean { return this.connectionFlow.busy; }
   get previewing(): boolean { return this.previewFlow.busy; }
@@ -87,7 +88,7 @@ export default class LanSyncPlugin extends Plugin {
       void this.engine.noteRename(oldPath, file.path).then(changed).catch(() => this.setStatus('路径不受支持，请查看设置'));
     }));
     this.registerInterval(window.setInterval(() => { if (this.settings.enabled && Date.now() >= this.nextAttempt) void this.sync(false, true); }, 5000));
-    this.registerInterval(window.setInterval(() => { if (this.settings.autoUpdate && this.settings.vaultId) void this.checkUpdate(false).catch(() => {}); }, 6 * 60 * 60 * 1000));
+    this.registerInterval(window.setInterval(() => { if (this.settings.autoUpdate && this.settings.vaultId) void this.checkUpdatesInBackground(); }, 6 * 60 * 60 * 1000));
     this.registerInterval(window.setInterval(() => { if (this.settings.storageLimitMiB > 0 && this.engine && this.disk && this.local) void this.checkStorage(false).catch(() => this.setStatus('容量检查失败，请打开设置重试')); }, 6 * 60 * 60 * 1000));
     this.registerEvent(this.app.workspace.on('active-leaf-change', changed));
     this.app.workspace.onLayoutReady(() => { void this.action(async () => {
@@ -97,7 +98,7 @@ export default class LanSyncPlugin extends Plugin {
       }
       await this.setup();
       if (this.settings.enabled) await this.sync(false);
-      if (this.settings.autoUpdate && this.settings.vaultId) void this.checkUpdate(false).catch(() => {});
+      if (this.settings.autoUpdate && this.settings.vaultId) void this.checkUpdatesInBackground();
       if (this.settings.storageLimitMiB > 0 && this.engine && this.disk && this.local) void this.checkStorage(false).catch(() => this.setStatus('容量检查失败，请打开设置重试'));
     }); });
   }
@@ -164,6 +165,15 @@ export default class LanSyncPlugin extends Plugin {
       if (result) new Notice(`插件 ${result} 已下载，重启 Obsidian 后生效。`, 10000);
       else if (manual) new Notice('插件已经是服务端提供的最新版本。');
     });
+  }
+  async checkUpdatesInBackground(): Promise<void> {
+    try { await this.checkUpdate(false); this.updateFailureNotified = false; }
+    catch {
+      if (!this.disposed && !this.updateFailureNotified) {
+        this.updateFailureNotified = true;
+        new Notice('自动更新检查失败，请在插件设置中手动检查更新。', 10000);
+      }
+    }
   }
   private enrollment(): Enrollment {
     const adapter = this.app.vault.adapter;

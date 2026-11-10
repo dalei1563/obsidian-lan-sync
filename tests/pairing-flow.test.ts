@@ -154,6 +154,15 @@ function isolatedUi(scenario: (fixture: typeof pluginFixture, check: typeof asse
   assert.equal(result.stdout, 'ui-flow-complete', 'UI flow must reach another event-loop turn after button cleanup');
 }
 
+test('background update failures notify once, then notify again after a successful retry', async () => {
+  const f = pluginFixture(async () => { throw new Error('unexpected request'); }); let fail = true;
+  f.plugin.checkUpdate = async () => { if (fail) throw new Error('offline'); };
+  await f.plugin.checkUpdatesInBackground(); await f.plugin.checkUpdatesInBackground();
+  assert.equal(f.notices.length, 1); assert.match(f.notices[0], /手动检查更新/);
+  fail = false; await f.plugin.checkUpdatesInBackground(); fail = true; await f.plugin.checkUpdatesInBackground();
+  assert.equal(f.notices.length, 2);
+});
+
 test('actual plugin shares bootstrap/manual pairing, rejects another code, and never starts first sync', async () => {
   const response = deferred<any>(); let requests = 0;
   const f = pluginFixture(async () => { requests++; return response.promise; });
