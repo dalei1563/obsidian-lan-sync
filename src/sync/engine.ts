@@ -339,6 +339,7 @@ export class Engine {
   private async work(idleCheck: boolean): Promise<void> {
     if (this.stopped || !this.state.initialized) return;
     if (this.state.overwrite) throw new Error('覆盖尚未完成，请在设置中继续或重新预览');
+    await this.remote.verifyProtocol();
     if (idleCheck && !this.state.applying && !this.state.pending.length && !Object.keys(this.state.issues).length && !this.state.deletePlan) {
       const before = JSON.stringify([this.state.epoch, this.state.cursor, this.state.serverExcludedPaths]);
       await this.pull();
@@ -368,6 +369,7 @@ export class Engine {
   }
   resolve(fileId: string, choice: 'local' | Revision): Promise<void> {
     return this.exclusive(async () => {
+      await this.remote.verifyProtocol();
       await this.pull();
       const e = this.state.entries[fileId], file = this.state.remote[fileId];
       if (!e || !file || !file.heads.length) throw new Error('无法找到文件版本');

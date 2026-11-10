@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { Remote } from '../src/sync/remote';
 import { client, fixture, MemoryVault, revision, transport } from './helpers';
-import { hash, id } from '../shared/protocol';
+import { hash, id, PROTOCOL } from '../shared/protocol';
 
 async function clients(t: Parameters<typeof fixture>[0]) {
   const f = await fixture(t), a = client(f.remoteA, f.store.serverId, f.first.deviceId), b = client(f.remoteB, f.store.serverId, f.second.deviceId);
@@ -143,6 +143,23 @@ test('local persistence failure prevents network publication', async t => {
   a.local.set('note.md', 'local'); await a.engine.initialize(); a.failSave = s => s.pending.length > 0;
   await assert.rejects(a.engine.sync(), /disk failure/);
   assert.equal(f.store.snapshot(f.first.vaultId).files.length, 0);
+});
+test('an established client refuses both older and newer server protocols before uploading', async t => {
+  const {f, a} = await clients(t);
+  a.local.set('note.md', 'base'); await a.engine.initialize(); await a.engine.sync();
+  a.local.set('note.md', 'unsent'); const cursor = f.store.snapshot(f.first.vaultId).cursor;
+  for (const protocol of [PROTOCOL - 1, PROTOCOL + 1]) {
+    let writes = 0;
+    const incompatible = new Remote(f.url, f.first.vaultId, f.first.token, async (...args) => {
+      if (args[0].endsWith('/v1/health')) return {status: 200, body: Buffer.from(JSON.stringify({ok: true, protocol}))};
+      if (args[1] !== 'GET') writes++;
+      return transport(...args);
+    });
+    const restored = client(incompatible, f.store.serverId, f.first.deviceId, a.local, a.saved);
+    await assert.rejects(restored.engine.sync(), /版本不兼容/);
+    assert.equal(writes, 0); assert.equal(a.local.text('note.md'), 'unsent');
+    assert.equal(f.store.snapshot(f.first.vaultId).cursor, cursor);
+  }
 });
 test('mass deletion requires exact approval at both sending and receiving devices', async t => {
   const { f, a, b } = await clients(t);

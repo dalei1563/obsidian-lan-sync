@@ -32,3 +32,10 @@ test('snapshot cleanup requires a current preview and never touches state or unk
   rmSync(unknown); const plan = disk.previewSnapshotCleanup(); assert.equal(plan.files.length, 2);
   assert.equal(disk.cleanupSnapshots(plan.fingerprint), 2); assert.deepEqual(disk.load(), state);
 });
+test('a newer state schema is refused without rewriting its contents', t => {
+  const runtime = resolve('.test-runtime'); mkdirSync(runtime, {recursive: true});
+  const root = join(runtime, 'schema-' + id()), disk = new DiskState(root);
+  t.after(() => { disk.close(); if (!root.startsWith(runtime + sep)) throw Error('Unsafe cleanup'); rmSync(root, {recursive: true, force: true}); });
+  const data = JSON.stringify({...newState(id(), id(), id()), schema: 2, future: 'keep'}), path = join(root, 'state.json');
+  writeFileSync(path, data); assert.throws(() => disk.load(), /版本不兼容/); assert.equal(readFileSync(path, 'utf8'), data);
+});

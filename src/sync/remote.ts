@@ -24,6 +24,12 @@ export class Remote {
     return response.body;
   }
   private path(tail: string) { return `/v1/vaults/${this.vaultId}/${tail}`; }
+  async verifyProtocol(): Promise<void> {
+    let health: any;
+    try { health = JSON.parse((await this.request('/v1/health')).toString('utf8')); }
+    catch (error) { if (error instanceof SyntaxError) throw new Error('服务端协议响应无效，请联系管理员'); throw error; }
+    if (!health?.ok || health.protocol !== PROTOCOL) throw new Error('客户端与服务端版本不兼容，请向管理员获取匹配版本');
+  }
   async snapshot(): Promise<Snapshot> {
     const s = JSON.parse((await this.request(this.path('state'))).toString('utf8')) as Snapshot;
     if (s.protocol !== PROTOCOL || !Array.isArray(s.files) || !validCursor(s.cursor) || typeof s.epoch !== 'string' || typeof s.serverId !== 'string') throw new Error('服务端协议或快照无效');

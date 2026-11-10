@@ -30,9 +30,12 @@ export class DiskState {
   load(): SyncState | null {
     const path = join(this.directory, 'state.json');
     if (!existsSync(path)) return null;
+    let s: SyncState;
+    try { s = JSON.parse(readFileSync(path, 'utf8')) as SyncState; }
+    catch { throw new Error('同步状态损坏，已暂停。请保留 local-state 目录，勿删除后直接重绑。'); }
+    if (s && s.schema !== 1) throw new Error('同步状态版本不兼容，已暂停。请保留 local-state 目录并使用匹配的插件版本。');
     try {
-      const s = JSON.parse(readFileSync(path, 'utf8')) as SyncState;
-      if (s.schema !== 1 || !s.entries || !s.remote || !Array.isArray(s.pending) || !validCursor(s.cursor)) throw new Error();
+      if (!s || !s.entries || !s.remote || !Array.isArray(s.pending) || !validCursor(s.cursor)) throw new Error();
       return s;
     } catch { throw new Error('同步状态损坏，已暂停。请保留 local-state 目录，勿删除后直接重绑。'); }
   }
