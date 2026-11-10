@@ -29,7 +29,7 @@ test('Windows installer discovers one registered Vault without requiring a path 
   mkdirSync(join(vault, '.obsidian'), { recursive: true }); mkdirSync(join(appdata, 'obsidian'), { recursive: true });
   const registry = JSON.stringify({ vaults: { test: { path: vault, ts: 1, open: true } } });
   writeFileSync(join(appdata, 'obsidian', 'obsidian.json'), registry);
-  const result = await command('powershell.exe', ['-NoProfile', '-File', resolve('deployment/install.ps1'), '-Connection', encodeConnection(f.url, 'c'.repeat(24))], { ...process.env, APPDATA: appdata });
+  const result = await command('powershell.exe', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', resolve('deployment/install.ps1'), '-Connection', encodeConnection(f.url, 'c'.repeat(24))], { ...process.env, APPDATA: appdata });
   assert.equal(result.code, 0, result.output);
   assert.equal(existsSync(join(vault, '.obsidian', 'plugins', 'lan-note-sync', 'bootstrap.json')), true);
   assert.equal(readFileSync(join(appdata, 'obsidian', 'obsidian.json'), 'utf8'), registry);
@@ -43,7 +43,7 @@ for (const platform of ['powershell', 'bash'] as const) {
     writeFileSync(join(vault, '笔记.md'), 'unchanged'); writeFileSync(join(vault, '.obsidian', 'community-plugins.json'), '["other"]');
     const connection = encodeConnection(f.url, 'c'.repeat(24));
     const executable = platform === 'powershell' ? 'powershell.exe' : bash;
-    const args = platform === 'powershell' ? ['-NoProfile', '-File', resolve('deployment/install.ps1'), '-VaultPath', vault, '-Connection', connection] : [posix(resolve('deployment/install.sh')), '--vault', posix(vault), '--connection', connection];
+    const args = platform === 'powershell' ? ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', resolve('deployment/install.ps1'), '-VaultPath', vault, '-Connection', connection] : [posix(resolve('deployment/install.sh')), '--vault', posix(vault), '--connection', connection];
     const result = await command(executable, args); assert.equal(result.code, 0, result.output);
     const plugin = join(vault, '.obsidian', 'plugins', 'lan-note-sync');
     const bootstrap = JSON.parse(readFileSync(join(plugin, 'bootstrap.json'), 'utf8').replace(/^\ufeff/, ''));
@@ -68,7 +68,8 @@ for (const platform of ['powershell', 'bash'] as const) {
     distribution.serve = (path, res) => { if (path === '/install/files/main.js') { res.writeHead(200); res.end('corrupt'); return true; } return normal(path, res); };
     const f = await fixture(t, distribution), vault = join(root, 'Vault'); mkdirSync(join(vault, '.obsidian'), { recursive: true });
     const connection = encodeConnection(f.url, 'c'.repeat(24));
-    const result = platform === 'powershell' ? await command('powershell.exe', ['-NoProfile', '-File', resolve('deployment/install.ps1'), '-VaultPath', vault, '-Connection', connection]) : await command(bash, [posix(resolve('deployment/install.sh')), '--vault', posix(vault), '--connection', connection]);
-    assert.notEqual(result.code, 0); assert.equal(existsSync(join(vault, '.obsidian', 'plugins', 'lan-note-sync')), false);
+    const result = platform === 'powershell' ? await command('powershell.exe', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', resolve('deployment/install.ps1'), '-VaultPath', vault, '-Connection', connection]) : await command(bash, [posix(resolve('deployment/install.sh')), '--vault', posix(vault), '--connection', connection]);
+    assert.notEqual(result.code, 0); assert.match(result.output, /integrity (verification|check) failed|failed integrity verification/i);
+    assert.equal(existsSync(join(vault, '.obsidian', 'plugins', 'lan-note-sync')), false);
   });
 }
