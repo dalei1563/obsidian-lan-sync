@@ -1,6 +1,6 @@
 {
   "name": "obsidian-lan-sync",
-  "version": "0.6.2",
+  "version": "0.6.3",
   "private": true,
   "description": "Self-hosted file and folder synchronization service and Obsidian desktop plugin",
   "engines": {

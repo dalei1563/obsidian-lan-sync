@@ -11,6 +11,21 @@ concurrency:
   group: publish-${{ github.ref }}
   cancel-in-progress: false
 jobs:
+  desktop:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.15.0
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - run: npm test
   verify:
     runs-on: ubuntu-latest
     services:
@@ -39,7 +54,7 @@ jobs:
           node -e "require('fs').writeFileSync('.test-runtime/couch-test.json',JSON.stringify({url:'http://127.0.0.1:5984',user:'ci_admin',password:'ci-only-ephemeral-password'}))"
       - run: npm run test:couch
   publish:
-    needs: verify
+    needs: [verify, desktop]
     runs-on: ubuntu-latest
     permissions:
       contents: read

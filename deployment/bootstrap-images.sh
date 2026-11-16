@@ -17,5 +17,5 @@ check_hash() {
 }
 check_hash "$stage/compose.production.yaml" 1e82fef8aeb567328851175ee102a528b650fc24d6233bf99941b42407e60732
 check_hash "$stage/deployment/setup-images.sh" 14dfa7516723c9f93c7e895ec56a3b813965be023fd55b0d740bf7890b05ae50
-bash "$stage/deployment/setup-images.sh" --image-prefix ghcr.io/dalei1563/obsidian-lan-sync --version 0.6.2 --expose-lan "$@"
+bash "$stage/deployment/setup-images.sh" --image-prefix ghcr.io/dalei1563/obsidian-lan-sync --version 0.6.3 --expose-lan "$@"
 

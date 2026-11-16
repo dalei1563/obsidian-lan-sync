@@ -50,14 +50,13 @@ case "$server" in *[!a-zA-Z0-9:/._\[\]-]*|*@*|*\?*|*\#*) printf '%s\n' '连接�
 # Read saved JSON with the native macOS parser; Linux may use Node or Python.
 read_setting() {
   if [ "$(uname -s)" = Darwin ]; then
-    plutil -lint "$target/data.json" >/dev/null || return 1
-    plutil -extract "$1" raw -o - "$target/data.json" 2>/dev/null || printf ''
+    /usr/bin/osascript -l JavaScript -e 'ObjC.import("Foundation"); function run(args) { var text = ObjC.unwrap($.NSString.stringWithContentsOfFileEncodingError(args[0], $.NSUTF8StringEncoding, null)); var d = JSON.parse(text.replace(/^\uFEFF/, "")); var v = d[args[1]]; if (v === undefined) return ""; if (typeof v !== "string") throw new Error("配置字段必须是文本"); return v; }' "$target/data.json" "$1"
   elif command -v node >/dev/null 2>&1; then
     node -e 'const fs=require("fs");const d=JSON.parse(fs.readFileSync(process.argv[1],"utf8").replace(/^\uFEFF/,"")); const v=d[process.argv[2]]; if(v!==undefined && typeof v!=="string")process.exit(1);process.stdout.write(v||"")' "$target/data.json" "$1"
   elif command -v python3 >/dev/null 2>&1; then
     python3 -c 'import json,sys; d=json.load(open(sys.argv[1],encoding="utf-8-sig")); v=d.get(sys.argv[2],""); assert isinstance(v,str); print(v,end="")' "$target/data.json" "$1"
   else
-    printf '%s\n' '读取已有配置需要系统 JSON 工具。macOS 使用 plutil；Linux 请安装 Node.js 或 Python 3。' >&2; return 1
+    printf '%s\n' '读取已有配置需要系统 JSON 工具。macOS 使用系统 JavaScript 解析器；Linux 请安装 Node.js 或 Python 3。' >&2; return 1
   fi
 }
 case "$connection_action" in ask|keep|switch) ;; *) printf '%s\n' '连接操作无效，请使用 ask、keep 或 switch。' >&2; exit 1;; esac
