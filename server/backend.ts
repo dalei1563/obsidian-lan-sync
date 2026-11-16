@@ -10,6 +10,7 @@ export interface Backend {
   createVault(name: string): Awaitable<{ id: string; name: string }>;
   renameVault(vaultId: string, name: string): Awaitable<void>;
   archiveVault(vaultId: string): Awaitable<void>;
+  deleteVault(vaultId: string, name: string): Awaitable<void>;
   setExclusions(vaultId: string, input: unknown): Awaitable<string[]>;
   activity(vaultId?: string, before?: string, limit?: number): Awaitable<ActivityPage>;
   createPair(name: string, vaultId?: string): Awaitable<{ code: string; vaultId: string; expires: number }>;

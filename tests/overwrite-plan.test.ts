@@ -8,7 +8,7 @@ function head(path: string, text: string): Revision {
   return {id: id(), fileId: id(), parents: [], path, deleted: false, hash: hash(text), size: Buffer.byteLength(text), clientId: id()};
 }
 function snapshot(...heads: Revision[]): Snapshot {
-  return {protocol: 2, serverId: id(), epoch: id(), cursor: 'cursor', files: heads.map(h => ({fileId: h.fileId, heads: [h]}))};
+  return {protocol: 3, serverId: id(), epoch: id(), cursor: 'cursor', files: heads.map(h => ({fileId: h.fileId, heads: [h]}))};
 }
 const excluded = (path: string) => isExcluded(path, normalizeExclusions(['private/']));
 function summary(plan: ReturnType<typeof planOverwrite>) { return plan.actions.map(a => [a.type, a.path]).sort(); }
@@ -40,5 +40,6 @@ test('ambiguous cloud conflicts and case collisions are not silently resolved', 
   const a = head('one.md', 'one'), b = {...head('one.md', 'two'), fileId: a.fileId};
   const conflict = snapshot(a); conflict.files[0].heads.push(b);
   assert.throws(() => planOverwrite('cloud-to-local', new Map(), conflict, excluded), /冲突/);
-  assert.throws(() => planOverwrite('local-to-cloud', new Map([['One.md', Buffer.from('one')]]), snapshot(a), excluded), /大小写/);
+  assert.deepEqual(summary(planOverwrite('local-to-cloud', new Map([['One.md', Buffer.from('one')]]), snapshot(a), excluded)), [['delete-cloud', 'one.md'], ['upload', 'One.md']]);
+  assert.throws(() => planOverwrite('local-to-cloud', new Map([['One.md', Buffer.from('one')], ['one.md', Buffer.from('one')]]), snapshot(a), excluded), /大小写/);
 });

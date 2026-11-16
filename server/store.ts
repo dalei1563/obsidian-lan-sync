@@ -1,8 +1,8 @@
 import { DatabaseSync } from 'node:sqlite';
 import { randomBytes } from 'node:crypto';
-import { mkdirSync, writeFileSync, readFileSync, existsSync, openSync, closeSync, fsyncSync, renameSync, unlinkSync, cpSync, lstatSync } from 'node:fs';
-import { resolve, join } from 'node:path';
-import { assertHash, assertId, Changes, CommitResult, Cursor, FileState, hash, id, MAX_BYTES, MAX_FILES, PairResult, pathsOverlap, PROTOCOL, Revision, Snapshot, SyncError, validateRevision } from '../shared/protocol';
+import { mkdirSync, writeFileSync, readFileSync, existsSync, openSync, closeSync, fsyncSync, renameSync, unlinkSync, cpSync, lstatSync, rmSync } from 'node:fs';
+import { resolve, join, sep } from 'node:path';
+import { assertHash, assertId, Changes, CommitResult, Cursor, FileState, hash, id, MAX_BYTES, MAX_FILES, PairResult, nodesOverlap, PROTOCOL, Revision, Snapshot, SyncError, validateRevision } from '../shared/protocol';
 import type { Backend, DeviceInfo } from './backend';
 import { ActivityPage, VaultSummary, activityId, activityLimit, managementName, parseActivityCursor, revisionAction, summarizeFiles } from '../shared/management';
 import { normalizeExclusions, isExcluded } from '../shared/exclusions';
@@ -36,6 +36,7 @@ export class Store implements Backend {
     if (!vaultColumns.has('created_at')) this.db.exec('ALTER TABLE vaults ADD COLUMN created_at INTEGER');
     if (!vaultColumns.has('excluded_paths')) this.db.exec("ALTER TABLE vaults ADD COLUMN excluded_paths TEXT NOT NULL DEFAULT '[]'");
     if (!vaultColumns.has('archived')) this.db.exec('ALTER TABLE vaults ADD COLUMN archived INTEGER NOT NULL DEFAULT 0');
+    if (!vaultColumns.has('deleting')) this.db.exec('ALTER TABLE vaults ADD COLUMN deleting INTEGER NOT NULL DEFAULT 0');
     const revisionColumns = new Set((this.db.prepare('PRAGMA table_info(revisions)').all() as Row[]).map(r => r.name));
     if (!revisionColumns.has('created_at')) this.db.exec('ALTER TABLE revisions ADD COLUMN created_at INTEGER');
     const version = this.db.prepare("SELECT value FROM meta WHERE key='schema'").get() as Row | undefined;
@@ -46,6 +47,7 @@ export class Store implements Backend {
     if (newEpoch) this.db.prepare("INSERT OR REPLACE INTO meta VALUES ('epoch',?)").run(id());
     this.db.prepare("INSERT OR IGNORE INTO meta VALUES ('epoch',?)").run(id());
     this.epoch = (this.db.prepare("SELECT value FROM meta WHERE key='epoch'").get() as Row).value;
+    for (const row of this.db.prepare('SELECT id,name FROM vaults WHERE deleting=1').all() as Row[]) this.deleteVault(row.id, row.name);
   }
   transaction<T>(fn: () => T): T {
     this.db.exec('BEGIN IMMEDIATE');
@@ -84,8 +86,9 @@ export class Store implements Backend {
   }
   objectPath(vaultId: string, sha: string): string { assertId(vaultId); assertHash(sha); return join(this.root, 'objects', vaultId, sha.slice(0, 2), sha); }
   putObject(vaultId: string, sha: string, data: Buffer): void {
+    this.vault(vaultId);
     assertHash(sha);
-    if (data.length > MAX_BYTES || hash(data) !== sha || !Buffer.from(data.toString('utf8'), 'utf8').equals(data)) throw new SyncError('invalid_object', '正文超限、哈希不符或不是有效 UTF-8', 400);
+    if (data.length > MAX_BYTES || hash(data) !== sha) throw new SyncError('invalid_object', '文件超限或哈希不符', 400);
     const target = this.objectPath(vaultId, sha), dir = join(this.root, 'objects', vaultId, sha.slice(0, 2));
     mkdirSync(dir, { recursive: true, mode: 0o700 });
     if (!existsSync(target)) {
@@ -123,6 +126,22 @@ export class Store implements Backend {
   }
   archiveVault(vaultId: string): void {
     this.transaction(() => { this.vault(vaultId); this.db.prepare('UPDATE vaults SET archived=1 WHERE id=?').run(vaultId); });
+  }
+  deleteVault(vaultId: string, name: string): void {
+    assertId(vaultId);
+    const vault = this.db.prepare('SELECT * FROM vaults WHERE id=?').get(vaultId) as Row | undefined;
+    if (!vault) throw new SyncError('vault_missing', '仓库不存在', 404);
+    if (name !== vault.name) throw new SyncError('vault_name_mismatch', '请输入完整仓库名称', 400);
+    // Durable intent blocks access first and resumes after an interrupted cleanup.
+    this.db.prepare('UPDATE vaults SET archived=1,deleting=1 WHERE id=?').run(vaultId);
+    const base = resolve(this.root, 'objects'), target = resolve(base, vaultId);
+    if (!target.startsWith(base + sep) || (existsSync(base) && lstatSync(base).isSymbolicLink()) || (existsSync(target) && lstatSync(target).isSymbolicLink())) throw new Error('Unsafe object directory');
+    rmSync(target, {recursive: true, force: true});
+    this.transaction(() => {
+      for (const table of ['heads', 'changes', 'operations', 'revisions', 'objects', 'pairing', 'devices']) this.db.prepare(`DELETE FROM ${table} WHERE vault_id=?`).run(vaultId);
+      this.db.prepare('DELETE FROM vaults WHERE id=?').run(vaultId);
+    });
+    this.db.exec('PRAGMA wal_checkpoint(TRUNCATE); VACUUM; PRAGMA wal_checkpoint(TRUNCATE);');
   }
   renameVault(vaultId: string, name: string): void {
     this.vault(vaultId); this.db.prepare('UPDATE vaults SET name=? WHERE id=?').run(managementName(name), vaultId);
@@ -207,7 +226,7 @@ export class Store implements Backend {
         const obj = this.db.prepare('SELECT size FROM objects WHERE vault_id=? AND hash=?').get(vaultId, revision.hash!) as Row | undefined;
         if (!obj || obj.size !== revision.size || !existsSync(this.objectPath(vaultId, revision.hash!))) throw new SyncError('object_missing', '正文未持久化');
         const paths = this.db.prepare('SELECT r.payload FROM heads h JOIN revisions r ON r.vault_id=h.vault_id AND r.id=h.revision_id WHERE h.vault_id=? AND h.file_id<>?').all(vaultId, revision.fileId) as Row[];
-        if (paths.some(p => { const r: Revision = JSON.parse(p.payload); return !r.deleted && pathsOverlap(r.path, revision.path); })) throw new SyncError('path_conflict', '目标路径已被其他逻辑文件占用');
+        if (paths.some(p => { const r: Revision = JSON.parse(p.payload); return !r.deleted && nodesOverlap(r, revision); })) throw new SyncError('path_conflict', '目标路径已被其他逻辑文件占用');
       }
       this.db.prepare('INSERT INTO revisions(vault_id,id,file_id,payload,created_at) VALUES (?,?,?,?,?)').run(vaultId, revision.id, revision.fileId, JSON.stringify(revision), Date.now());
       // Existing heads form an antichain: no current head can be an ancestor of an

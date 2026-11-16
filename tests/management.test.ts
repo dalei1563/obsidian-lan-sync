@@ -7,6 +7,7 @@ import { Store } from '../server/store';
 import { CouchStore, CouchOptions } from '../server/couch-store';
 import type { Backend } from '../server/backend';
 import { hash, id, Revision, SyncError } from '../shared/protocol';
+import { planVaultRestore } from '../server/vault-restore';
 import type { ActivityItem } from '../shared/management';
 
 const configFile = process.env.COUCH_TEST_CONFIG;
@@ -39,6 +40,85 @@ async function submit(store: Backend, vaultId: string, deviceId: string, body: s
 }
 for (const kind of ['sqlite', 'couchdb'] as const) {
   const options = { skip: kind === 'couchdb' && !configFile, timeout: 60000 };
+  test(`${kind} tree protocol: directories coexist with children, binary objects survive restart, and restore accepts trees`, options, async t => {
+    const f = await managementFixture(t, kind), store = f.store;
+    const pair = await store.pair((await store.createPair('Tree')).code, 'Tree client');
+    const folder = await submit(store, pair.vaultId, pair.deviceId, '', {path: 'Folder', kind: 'directory'});
+    const nested = await submit(store, pair.vaultId, pair.deviceId, '', {path: 'Folder/Empty', kind: 'directory'});
+    const bytes = Buffer.from([255,0,128,10]); await store.putObject(pair.vaultId, hash(bytes), bytes);
+    const file: Revision = {id: id(), fileId: id(), parents: [], path: 'Folder/image.png', deleted: false, hash: hash(bytes), size: bytes.length, clientId: pair.deviceId};
+    await store.commit(pair.vaultId, file, pair.deviceId);
+    await assert.rejects(async () => submit(store, pair.vaultId, pair.deviceId, 'collision', {path: 'Folder'}), errorCode('path_conflict'));
+    await assert.rejects(async () => submit(store, pair.vaultId, pair.deviceId, 'not empty', {path: 'Invalid', kind: 'directory'}), errorCode('invalid_directory'));
+    await assert.rejects(async () => submit(store, pair.vaultId, pair.deviceId, 'case collision', {path: 'folder/other.txt'}), errorCode('path_conflict'));
+    const snapshot = await store.snapshot(pair.vaultId);
+    assert.equal(planVaultRestore(file.id, snapshot, snapshot.files).actions.length, 0);
+    await f.reopen();
+    assert.deepEqual(await f.store.getObject(pair.vaultId, hash(bytes)), bytes);
+    const current = await f.store.snapshot(pair.vaultId);
+    assert.equal(current.files.find(f => f.fileId === folder.revision.fileId)!.heads[0].kind, 'directory');
+    const deleted = await submit(f.store, pair.vaultId, pair.deviceId, null, {fileId: nested.revision.fileId, parents: [nested.revision.id], path: nested.revision.path, kind: 'directory'});
+    const plan = planVaultRestore(file.id, await f.store.snapshot(pair.vaultId), snapshot.files);
+    assert.equal(plan.actions.length, 1); assert.equal(plan.actions[0].target!.kind, 'directory');
+    await f.store.commit(pair.vaultId, {...nested.revision, id: id(), parents: [deleted.revision.id]}, pair.deviceId);
+    const summary = (await f.store.listVaults())[0]; assert.equal(summary.files, 1); assert.equal(summary.directories, 2);
+  });
+  test(`${kind} management: permanent deletion erases owned data and preserves other vaults across restart`, options, async t => {
+    const f = await managementFixture(t, kind), store = f.store;
+    const a = await store.createVault('Delete me'), b = await store.createVault('Keep me');
+    const pair = await store.pair((await store.createPair(a.name, a.id)).code, 'A');
+    const other = await store.pair((await store.createPair(b.name, b.id)).code, 'B');
+    const unused = await store.createPair(a.name, a.id);
+    const saved = await submit(store, a.id, pair.deviceId, 'same content');
+    await submit(store, a.id, pair.deviceId, 'new content', {fileId: saved.revision.fileId, parents: [saved.revision.id]});
+    await submit(store, b.id, other.deviceId, 'same content');
+    const orphan = Buffer.from('uncommitted upload'); await store.putObject(a.id, hash(orphan), orphan);
+    for (let i = 0; i < 105; i++) { const bytes = Buffer.from('extra upload ' + i); await store.putObject(a.id, hash(bytes), bytes); }
+    await assert.rejects(async () => store.deleteVault(a.id, 'Delete me '), errorCode('vault_name_mismatch'));
+    assert.equal((await store.snapshot(a.id)).files.length, 1);
+    await store.deleteVault(a.id, a.name);
+    await assert.rejects(async () => store.authenticate(pair.token));
+    await assert.rejects(async () => store.pair(unused.code, 'New'));
+    await assert.rejects(async () => store.getObject(a.id, saved.revision.hash!));
+    await assert.rejects(async () => store.getObject(a.id, hash(orphan)));
+    await assert.rejects(async () => store.putObject(a.id, hash(orphan), orphan));
+    assert.equal((await store.history(a.id, saved.revision.fileId)).length, 0);
+    if (store instanceof Store) {
+      for (const table of ['devices','pairing','objects','revisions','heads','changes','operations']) assert.equal((store.db.prepare(`SELECT COUNT(*) n FROM ${table} WHERE vault_id=?`).get(a.id) as {n: number}).n, 0);
+    } else {
+      const docs = await (store as any).prefix('');
+      assert.equal(docs.some((doc: any) => doc.vaultId === a.id), false);
+    }
+    await f.reopen();
+    assert.deepEqual((await f.store.listVaults()).map(v => v.id), [b.id]);
+    assert.equal((await f.store.history(a.id, saved.revision.fileId)).length, 0);
+    assert.equal((await f.store.getObject(b.id, hash(Buffer.from('same content')))).toString(), 'same content');
+    assert.equal((await f.store.snapshot(b.id)).files.length, 1);
+    assert.equal((await f.store.authenticate(other.token)).vaultId, b.id);
+  });
+  test(`${kind} management: archived vaults can also be permanently deleted`, options, async t => {
+    const f = await managementFixture(t, kind), vault = await f.store.createVault('Archived');
+    await f.store.archiveVault(vault.id); await f.store.deleteVault(vault.id, vault.name);
+    await assert.rejects(async () => f.store.deleteVault(vault.id, vault.name), errorCode('vault_missing'));
+  });
+  test(`${kind} management: interrupted permanent deletion resumes at startup`, options, async t => {
+    const f = await managementFixture(t, kind), store = f.store;
+    const vault = await store.createVault('Interrupted');
+    const pair = await store.pair((await store.createPair(vault.name, vault.id)).code, 'A');
+    await submit(store, vault.id, pair.deviceId, 'erase me');
+    if (store instanceof Store) {
+      store.transaction = () => { throw new Error('Injected deletion interruption'); };
+    } else {
+      const original = (store as any).raw.bind(store); let purges = 0;
+      (store as any).raw = (...args: any[]) => { if (args[0] === '/_purge' && ++purges === 2) throw new Error('Injected deletion interruption'); return original(...args); };
+    }
+    await assert.rejects(async () => store.deleteVault(vault.id, vault.name), /Injected/);
+    await assert.rejects(async () => store.authenticate(pair.token));
+    await f.reopen();
+    assert.equal((await f.store.listVaults()).length, 0);
+    await assert.rejects(async () => f.store.getObject(vault.id, hash(Buffer.from('erase me'))));
+    await assert.rejects(async () => f.store.putObject(vault.id, hash(Buffer.from('late upload')), Buffer.from('late upload')));
+  });
   test(`${kind} management: multi-vault summaries and immutable activity pagination remain isolated`, options, async t => {
     const f = await managementFixture(t, kind), store = f.store;
     const a = await store.createVault('  Team A  '), b = await store.createVault('Team B');

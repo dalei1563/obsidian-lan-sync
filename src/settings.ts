@@ -25,7 +25,7 @@ export class LanSettingTab extends PluginSettingTab {
     if (this.plugin.unloaded) return;
     const { containerEl } = this, plugin = this.plugin; containerEl.empty(); containerEl.addClass('lan-sync-settings');
     containerEl.createEl('h2', { text: '自己的笔记同步' });
-    containerEl.createEl('p', { text: '在 Windows 和 macOS 之间同步 Markdown 笔记。每个本地笔记库可独立连接自己的远端仓库，复制该仓库的连接码即可开始。' });
+    containerEl.createEl('p', { text: '在 Windows 和 macOS 之间同步笔记、附件和文件夹。每个本地笔记库可独立连接自己的远端仓库，复制该仓库的连接码即可开始。' });
     const card = containerEl.createDiv('lan-sync-card'); this.statusEl = card.createEl('strong', { text: plugin.status });
     if (!plugin.settings.vaultId) {
       new Setting(containerEl).setName('连接码').setDesc('每台设备使用新的一次性连接码。多设备同步同一仓库时，请在后台的同一仓库分别生成新码。粘贴 lansync: 完整连接码；通过安装命令接入时会自动填写。').addTextArea(t => {

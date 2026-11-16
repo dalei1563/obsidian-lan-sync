@@ -31,6 +31,13 @@ function name(value: unknown): string {
 }
 function equal(a: string, b: string): boolean { const x = Buffer.from(a), y = Buffer.from(b); return x.length === y.length && timingSafeEqual(x, y); }
 
+function previewContent(revision: Revision, bytes: Buffer | null): {content: string | null; kind: string} {
+  if (revision.kind === 'directory') return {content: null, kind: 'directory'};
+  if (!bytes) return {content: null, kind: 'file'};
+  const text = bytes.toString('utf8');
+  return !text.includes('\0') && Buffer.from(text, 'utf8').equals(bytes) ? {content: text, kind: 'file'} : {content: null, kind: 'binary'};
+}
+
 /** One administrator password, independent from all Obsidian device tokens. */
 export class AdminController {
   private readonly salt = randomBytes(16);
@@ -196,8 +203,8 @@ export class AdminController {
           const revisionId = url.searchParams.get('revisionId');
           if (revisionId) {
             const revision = await this.historical(vaultId, fileId, revisionId);
-            const content = revision.deleted ? null : (await this.store.getObject(vaultId, revision.hash!)).toString('utf8');
-            json(res, 200, { revision, content }); return true;
+            const content = revision.deleted ? null : await this.store.getObject(vaultId, revision.hash!);
+            json(res, 200, { revision, ...previewContent(revision, content) }); return true;
           }
           const items = await this.store.history(vaultId, fileId, url.searchParams.get('before') || undefined);
           json(res, 200, { items, heads: current.heads.map(h => h.id), nextCursor: items.length === 100 ? items[items.length - 1].seq : null }); return true;
@@ -217,6 +224,11 @@ export class AdminController {
       if (repo) {
         const [, id, action, fileId] = repo; assertId(id);
         if (fileId && action !== 'files') throw new SyncError('not_found', '管理接口不存在', 404);
+        if (!action && req.method === 'DELETE') {
+          const input = await read(req);
+          if (input?.confirm !== 'permanent') throw new SyncError('confirmation_required', '请确认永久删除仓库及全部数据', 400);
+          await this.store.deleteVault(id, input?.name); json(res, 200, {ok: true}); return true;
+        }
         const vault = (await this.store.listVaults()).find(v => v.id === id);
         if (!vault) throw new SyncError('vault_missing', '仓库不存在', 404);
         if (action === 'archive' && req.method === 'POST') {
@@ -230,12 +242,13 @@ export class AdminController {
           if (file.heads.length !== 1) throw new SyncError('file_conflict', '文件有多个版本，请先在插件中处理冲突', 409);
           const head = file.heads[0];
           const content = await this.store.getObject(id, head.hash!);
-          json(res, 200, { path: head.path, content: content.toString('utf8'), revisionId: head.id }); return true;
+          json(res, 200, { path: head.path, ...previewContent(head, content), revisionId: head.id }); return true;
         }
         if (action === 'files' && req.method === 'GET') {
           const snapshot = await this.store.snapshot(id);
           const files = snapshot.files.map(file => ({
             fileId: file.fileId,
+            kind: file.heads.every(h => h.kind === 'directory') ? 'directory' : 'file',
             paths: [...new Set(file.heads.map(head => head.path))],
             size: Math.max(0, ...file.heads.filter(head => !head.deleted).map(head => head.size)),
             conflicts: file.heads.length > 1,
@@ -255,7 +268,7 @@ export class AdminController {
           const data = await read(req); let instructions: ReturnType<typeof invitationInstructions>;
           try { instructions = invitationInstructions(data?.server, '0'.repeat(24)); } catch { throw new SyncError('invalid_url', '请使用可访问的服务根地址', 400); }
           const pair = await this.store.createPair(vault.name, id);
-          instructions = invitationInstructions(data.server, pair.code);
+          instructions = invitationInstructions(data.server, pair.code, {id: vault.id, name: vault.name});
           json(res, 201, { vaultId: pair.vaultId, expires: pair.expires, ...instructions }); return true;
         }
       }

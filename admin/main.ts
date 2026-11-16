@@ -1,5 +1,5 @@
 interface VaultSummary {
-  id: string; name: string; createdAt: number | null; files: number; deletedFiles: number;
+  id: string; name: string; createdAt: number | null; files: number; directories?: number; deletedFiles: number;
   conflicts: number; revisionCount: number; bytes: number; devices: number; excludedPaths: string[];
 }
 interface DeviceInfo { id: string; vault_id: string; name: string; revoked: number; lastSeenAt?: number | null }
@@ -81,12 +81,12 @@ class Manager {
   private overview?: Overview;
   private view: View = 'overview';
   private selectedVault = '';
+  private vaultSection: 'files' | 'activity' | 'devices' | 'settings' = 'files';
   private activityFilter = '';
   private deviceFilter = '';
   private activity?: ActivityPage;
   private activityBusy = false;
   private activityRequest = 0;
-  private dashboardActivity?: ActivityItem[];
   private refreshedAt = 0;
   private refreshing = false;
   private overviewSequence = 0;
@@ -96,7 +96,7 @@ class Manager {
   private dialog?: HTMLDialogElement;
   private drafts = new Map<string, string>();
   private repoSearch = '';
-  private readonly viewNames: Record<View, string> = { overview: '同步总览', vaults: '笔记仓库', activity: '同步记录', devices: '设备管理', settings: '服务设置' };
+  private readonly viewNames: Record<View, string> = { overview: '服务状态', vaults: '笔记仓库', activity: '同步记录', devices: '客户端', settings: '服务设置' };
 
   async start() {
     if (!this.started) {
@@ -125,7 +125,7 @@ class Manager {
 
   private async api<T>(path: string, method = 'GET', data?: unknown): Promise<T> {
     const generation = this.sessionGeneration;
-    const controller = new AbortController(), timer = window.setTimeout(() => controller.abort(), 20000);
+    const controller = new AbortController(), timer = window.setTimeout(() => controller.abort(), method === 'DELETE' ? 120000 : 20000);
     try {
       const response = await fetch('/admin/api' + path, { method, credentials: 'same-origin', cache: 'no-store', signal: controller.signal,
         headers: { ...(data === undefined ? {} : { 'Content-Type': 'application/json' }), ...(method !== 'GET' && this.csrf ? { 'X-CSRF-Token': this.csrf } : {}) },
@@ -155,7 +155,7 @@ class Manager {
   }
 
   private renderLogin(unconfigured = false, error = '') {
-    this.sessionGeneration++; this.authenticated = false; this.dashboardActivity = undefined; this.activity = undefined; this.activityRequest++; appRoot.replaceChildren();
+    this.sessionGeneration++; this.authenticated = false; this.activity = undefined; this.activityRequest++; appRoot.replaceChildren();
     const screen = el('main', 'login-screen'), wrap = el('div', 'login-wrap'), brand = el('div', 'login-brand');
     append(brand, el('span', 'brand-mark', 'N'), el('span', '', 'LAN Note Sync'));
     const card = el('section', 'login-card'); append(card, el('h1', '', '管理你的笔记同步'), el('p', '', '输入管理员密码，进入你自己的同步服务。'));
@@ -190,14 +190,16 @@ class Manager {
       const overview = await this.api<Overview>('/overview');
       if (sequence !== this.overviewSequence || generation !== this.sessionGeneration) return;
       this.overview = overview; this.refreshedAt = Date.now();
+      const vaultCount = document.querySelector('[data-view="vaults"] .nav-count');
+      if (vaultCount) vaultCount.textContent = count(overview.vaults.length);
       const status = document.getElementById('service-status'); if (status) { status.className = 'badge green'; status.replaceChildren(el('span', 'status-dot'), document.createTextNode('服务已连接')); }
       const stamp = document.getElementById('refresh-stamp'); if (stamp) stamp.textContent = '更新于 ' + new Date(this.refreshedAt).toLocaleTimeString('zh-CN', { hour12: false });
-      if (render && this.view === 'overview') this.dashboardActivity = undefined;
       if (render && this.authenticated) this.renderContent();
     } finally { if (sequence === this.overviewSequence) this.refreshing = false; }
   }
 
   private navigate(view: View, vaultId = '') {
+    if (view === 'vaults' && vaultId !== this.selectedVault) this.vaultSection = 'files';
     const hash = '#/' + view + (vaultId ? '/' + encodeURIComponent(vaultId) : '');
     if (location.hash === hash) this.route(); else location.hash = hash;
   }
@@ -212,23 +214,22 @@ class Manager {
 
   private renderShell() {
     appRoot.replaceChildren(); const layout = el('div', 'layout'), side = el('aside', 'sidebar');
-    const brand = el('div', 'sidebar-brand'), copy = el('div', 'brand-copy'); append(copy, el('strong', '', 'LAN Note Sync'), el('span', '', 'SELF HOSTED SYNC'));
-    append(brand, el('span', 'brand-mark', 'N'), copy); side.append(brand, el('div', 'nav-label', '工作空间'));
+    const brand = el('div', 'sidebar-brand'), copy = el('div', 'brand-copy'); append(copy, el('strong', '', 'LAN Note Sync'));
+    append(brand, el('span', 'brand-mark', 'N'), copy); side.append(brand);
     const nav = el('nav', 'nav'); nav.setAttribute('aria-label', '管理导航');
-    const items: [View, IconName][] = [['overview', 'grid'], ['vaults', 'folder'], ['activity', 'activity'], ['devices', 'devices'], ['settings', 'settings']];
+    const items: [View, IconName][] = [['overview', 'server'], ['vaults', 'folder'], ['activity', 'activity'], ['devices', 'devices'], ['settings', 'settings']];
     for (const [view, glyph] of items) {
       const item = el('button', 'nav-item'); item.type = 'button'; item.dataset.view = view; append(item, icon(glyph), el('span', '', this.viewNames[view]));
       if (view === 'vaults') item.append(el('span', 'nav-count', count(this.overview?.vaults.length ?? 0)));
       item.addEventListener('click', () => this.navigate(view)); nav.append(item);
     }
     side.append(nav);
-    const bottom = el('div', 'sidebar-bottom'), service = el('div', 'sidebar-server'); const serviceText = el('div');
-    append(serviceText, el('strong', '', '自己的同步服务'), el('span', '', '由 CouchDB 持久化数据')); append(service, icon('server'), serviceText); bottom.append(service);
+    const bottom = el('div', 'sidebar-bottom');
     const logout = el('button', 'nav-item'); append(logout, icon('logout'), el('span', '', '退出管理台')); logout.addEventListener('click', () => void this.logout(logout)); bottom.append(logout); side.append(bottom);
     const main = el('div', 'main'), top = el('header', 'topbar'), breadcrumb = el('div', 'breadcrumb'), current = el('strong', '', this.viewNames[this.view]); current.id = 'breadcrumb-current';
     append(breadcrumb, icon('server'), el('span', '', '管理台'), el('span', '', '/'), current);
     const meta = el('div', 'topbar-meta'), stamp = el('span', 'refresh-label', '更新于 ' + new Date(this.refreshedAt || Date.now()).toLocaleTimeString('zh-CN', { hour12: false })); stamp.id = 'refresh-stamp';
-    const ready = badge('服务已连接', 'green'); ready.id = 'service-status'; ready.prepend(el('span', 'status-dot')); append(meta, stamp, ready, el('span', 'avatar', '管'));
+    const ready = badge('服务已连接', 'green'); ready.id = 'service-status'; ready.prepend(el('span', 'status-dot')); append(meta, stamp, ready);
     append(top, breadcrumb, meta); this.content = el('main', 'content'); this.content.id = 'main-content'; append(main, top, this.content); append(layout, side, main); appRoot.append(layout);
   }
 
@@ -242,15 +243,11 @@ class Manager {
     else this.renderSettings();
   }
   private head(title: string, description: string, ...actions: HTMLElement[]) {
-    const head = el('div', 'page-head'), text = el('div'); append(text, el('h1', '', title), el('p', '', description));
+    const head = el('div', 'page-head'), text = el('div'); text.append(el('h1', '', title)); if (description) text.append(el('p', '', description));
     append(head, text, append(el('div', 'page-actions'), ...actions)); this.content!.append(head);
   }
   private refreshButton() {
     const b = button('刷新', () => void this.run(async () => { await this.loadOverview(); if (this.view === 'activity') await this.loadActivity(); }, b), 'subtle', 'refresh'); return b;
-  }
-  private metric(label: string, value: string, note: string, glyph: IconName, color = '') {
-    const card = el('div', 'metric'), top = el('div', 'metric-top'); append(top, el('span', '', label), append(el('span', 'metric-icon ' + color), icon(glyph)));
-    return append(card, top, el('strong', 'metric-value', value), el('span', 'metric-note', note));
   }
   private card(title: string, subtitle = '', action?: HTMLElement): { card: HTMLElement; body: HTMLElement } {
     const card = el('section', 'card'), head = el('div', 'card-head'), titles = el('div'); append(titles, el('h2', 'card-title', title)); if (subtitle) titles.append(el('p', 'card-subtitle', subtitle)); append(head, titles, action); const body = el('div'); append(card, head, body); return { card, body };
@@ -261,30 +258,11 @@ class Manager {
 
   private renderOverview() {
     const data = this.overview!, totals = data.totals;
-    this.head('同步总览', '查看笔记仓库、设备授权和最近的文件变更。', this.refreshButton(), button('新建仓库', () => this.vaultNameDialog(), 'primary', 'plus'));
-    const metrics = el('div', 'metrics'); append(metrics,
-      this.metric('笔记仓库', count(totals.vaults), '独立存储 · 按仓库配对', 'folder'),
-      this.metric('同步文件', count(totals.files), '当前有效的逻辑文件', 'file', 'green'),
-      this.metric('已授权设备', count(totals.devices), '每台设备使用独立凭证', 'devices', 'purple'),
-      this.metric('版本冲突', count(totals.conflicts), totals.conflicts ? '在 Obsidian 插件中选择保留版本' : '当前没有需要选择的并发版本', 'shield', 'orange'));
-    this.content!.append(metrics);
-    const repos = this.card('笔记仓库', '一个服务可以管理多个独立的 Obsidian 笔记库', button('查看全部', () => this.navigate('vaults'), 'link'));
-    repos.body.append(this.vaultTable(data.vaults.slice(0, 5))); this.content!.append(repos.card);
-    const columns = el('div', 'two-col'), recent = this.card('最近同步记录', '服务端已接收的文件变更', button('全部记录', () => this.navigate('activity'), 'link'));
-    if (this.dashboardActivity) recent.body.append(this.activityTable(this.dashboardActivity, true));
-    else {
-      recent.body.append(el('div', 'loading', '正在读取最近变更…'));
-      void this.api<ActivityPage>('/activity?limit=5').then(page => { this.dashboardActivity = page.items; if (this.view === 'overview' && recent.body.isConnected) recent.body.replaceChildren(this.activityTable(page.items, true)); }).catch(e => { if (recent.body.isConnected) recent.body.replaceChildren(this.empty('暂时无法读取记录', e instanceof Error ? e.message : '请刷新重试', 'activity')); });
-    }
-    const quick = this.card('快速开始', '把配置留在服务端，让写作更简单'), quickBody = el('div', 'card-body quick-actions');
-    quickBody.append(this.quickAction('新建独立仓库', '给另一套笔记留出独立空间', 'folder', () => this.vaultNameDialog()));
-    quickBody.append(this.quickAction('连接一台新设备', '选择仓库，生成一次性安装命令', 'devices', () => { if (data.vaults.length === 1) void this.inviteDialog(data.vaults[0]); else this.navigate('vaults'); }));
-    quickBody.append(this.quickAction('设置排除规则', '按仓库决定哪些文件参与同步', 'shield', () => { if (data.vaults.length === 1) this.navigate('vaults', data.vaults[0].id); else this.navigate('vaults'); }));
-    append(quickBody, el('div', 'divider'), this.infoList([['正文占用', size(totals.bytes)], ['累计业务版本', count(totals.revisions)], ['服务运行', uptime(data.uptimeSeconds)]])); quick.body.append(quickBody); append(columns, recent.card, quick.card); this.content!.append(columns);
-    this.content!.append(el('p', 'footnote', '管理台展示服务端状态。设备断网、打开中的笔记和本地待上传项，请在对应 Obsidian 插件中查看。'));
-  }
-  private quickAction(title: string, description: string, glyph: IconName, action: () => void) {
-    const b = el('button', 'quick-action'); b.type = 'button'; const text = el('div'); append(text, el('strong', '', title), el('p', '', description)); append(b, append(el('span', 'quick-icon'), icon(glyph)), text, icon('arrow')); b.addEventListener('click', action); return b;
+    this.head('服务状态', '', this.refreshButton());
+    const health = el('section', 'service-health');
+    append(health, append(el('div'), el('h2', '', '服务已连接'), el('p', 'muted', '每 20 秒自动检查')),
+      this.infoList([['运行时间', uptime(data.uptimeSeconds)], ['服务版本', data.version || '—'], ['存储后端', data.backend], ['文件占用', size(totals.bytes)]]));
+    this.content!.append(health);
   }
   private infoList(items: [string, string][]) {
     const list = el('dl', 'info-list'); for (const [label, value] of items) append(list, append(el('div', 'info-row'), el('dt', '', label), el('dd', '', value))); return list;
@@ -295,21 +273,21 @@ class Manager {
   }
   private vaultTable(vaults: VaultSummary[]) {
     if (!vaults.length) return this.empty('还没有笔记仓库', '新建一个仓库，再为每台设备生成独立的连接码，就可以开始同步。', 'folder', button('新建仓库', () => this.vaultNameDialog(), 'primary small', 'plus'));
-    const { wrap, body } = this.table(['仓库名称', '文件', '正文占用', '设备', '状态', '操作']);
+    const { wrap, body } = this.table(['仓库名称', '文件', '文件占用', '设备', '状态', '操作']);
     for (const vault of vaults) {
       const row = el('tr'), name = el('td'), cell = el('div', 'name-cell'), text = el('div');
       const title = button(vault.name, () => this.navigate('vaults', vault.id), 'link'); title.title = vault.name;
       append(text, append(el('strong'), title), el('div', 'subline mono', vault.id.slice(0, 8))); append(cell, append(el('span', 'folder-icon'), icon('folder')), text); name.append(cell);
       const state = el('td'); state.append(vault.conflicts ? badge(`${count(vault.conflicts)} 项冲突`, 'orange') : badge('正常', 'green'));
       const actions = el('td'), buttons = el('div', 'table-actions');
-      append(buttons, button('管理', () => this.navigate('vaults', vault.id), 'small'), button('连接设备', () => void this.inviteDialog(vault), 'small primary')); actions.append(buttons);
+      append(buttons, button('管理', () => this.navigate('vaults', vault.id), 'small'), button('连接设备', () => void this.inviteDialog(vault), 'small primary'), button('删除', () => this.archiveVaultDialog(vault), 'small danger')); actions.append(buttons);
       append(row, name, el('td', '', count(vault.files)), el('td', '', size(vault.bytes)), el('td', '', count(vault.devices)), state, actions); body.append(row);
     }
     return wrap;
   }
 
   private renderVaults() {
-    this.head('笔记仓库', '每个 Obsidian 笔记库都能独立配对，数据按仓库隔离。', this.refreshButton(), button('新建仓库', () => this.vaultNameDialog(), 'primary', 'plus'));
+    this.head('笔记仓库', '', this.refreshButton(), button('新建仓库', () => this.vaultNameDialog(), 'primary', 'plus'));
     const card = el('section', 'card'), toolbar = el('div', 'card-toolbar'), search = el('div', 'search'), input = el('input', 'input');
     input.type = 'search'; input.placeholder = '搜索仓库名称或 ID'; input.setAttribute('aria-label', '搜索仓库'); input.value = this.repoSearch;
     append(search, icon('search'), input); append(toolbar, search, el('span', 'muted small-text', `共 ${count(this.overview!.vaults.length)} 个仓库`));
@@ -326,7 +304,7 @@ class Manager {
     if (!vault) { this.head('仓库不存在', '这个仓库可能尚未加载，请刷新列表。', button('返回仓库列表', () => this.navigate('vaults'))); return; }
     const back = button('返回仓库列表', () => this.navigate('vaults'), 'link'); back.classList.add('back-link'); this.content!.append(back);
     this.head(vault.name, `仓库 ID：${vault.id}`, button('重命名', () => this.vaultNameDialog(vault)), button('连接新设备', () => void this.inviteDialog(vault), 'primary', 'plus'));
-    const cols = el('div', 'two-col'), policy = this.card('排除同步', '规则保存在这个仓库中，供配套插件读取'), policyBody = el('div', 'card-body');
+    const cols = el('div', 'two-col vault-settings'), policy = this.card('排除同步', '规则保存在这个仓库中，供配套插件读取'), policyBody = el('div', 'card-body');
     const notice = el('div', 'notice'); append(notice, icon('shield'), el('span', '', '.obsidian 和隐藏路径始终不会同步。新增排除规则会暂停相关文件的同步，保留本地文件和已同步的云端内容。'));
     const chips = el('div', 'rule-chips'); chips.append(el('span', 'rule-chip', '.obsidian/**'), el('span', 'rule-chip', '隐藏目录 · 固定排除'));
     const label = el('label', 'field-label', '自定义排除规则 · 每行一条'), rules = el('textarea', 'input textarea'); rules.id = 'exclusion-rules'; label.htmlFor = rules.id; rules.rows = 7; rules.spellcheck = false;
@@ -340,38 +318,97 @@ class Manager {
     }, save), 'primary', 'check');
     append(policyBody, notice, chips, label, rules, hint, append(el('div', 'save-row'), el('span', '', '不会删除任何已同步文件。重新纳入后会继续核对版本。'), save)); policy.body.append(policyBody);
     const info = this.card('仓库信息'), infoBody = el('div', 'card-body');
-    const stats = el('div', 'detail-stats'); for (const [value, text] of [[count(vault.files), '当前文件'], [count(vault.devices), '已授权设备'], [count(vault.conflicts), '并发冲突']] as [string, string][]) append(stats, append(el('div', 'detail-stat'), el('strong', '', value), el('span', '', text)));
-    append(infoBody, stats, this.infoList([['正文占用', size(vault.bytes)], ['累计业务版本', count(vault.revisionCount)], ['已删除文件身份', count(vault.deletedFiles)], ['创建时间', date(vault.createdAt, true)]]));
-    const copyId = button('复制完整仓库 ID', () => void this.run(() => copy(vault.id)), 'small', 'copy');
-    infoBody.append(el('div', 'divider'), copyId, button('移除仓库', () => this.archiveVaultDialog(vault), 'small'));
-    info.body.append(infoBody); append(cols, policy.card, info.card); this.content!.append(cols);
-    const listing = this.card('仓库文件', '当前已同步的 Markdown 文件', button('恢复整个仓库', () => void this.vaultHistory(vault.id), 'subtle', 'clock'));
-    const listBody = el('div', 'card-body'); listBody.append(el('p', 'muted', '正在读取文件…')); listing.body.append(listBody); this.content!.append(listing.card);
-    void this.api<{files: {fileId: string; paths: string[]; size: number; conflicts: boolean; deleted: boolean}[]}>('/vaults/' + encodeURIComponent(vault.id) + '/files').then(result => {
+    append(infoBody, this.infoList([['历史版本', count(vault.revisionCount)], ['已删除文件', count(vault.deletedFiles)], ['创建时间', date(vault.createdAt, true)]]));
+    const copyId = button('复制仓库 ID', () => void this.run(() => copy(vault.id)), 'small', 'copy');
+    infoBody.append(append(el('div', 'settings-actions'), copyId));
+    info.body.append(infoBody);
+    const danger = el('section', 'vault-danger');
+    append(danger, el('h2', 'card-title', '永久删除仓库'), el('p', 'field-help', '永久清除服务端文件、历史版本和连接凭证，不可恢复。客户端本地笔记保留。'),
+      button('永久删除仓库', () => this.archiveVaultDialog(vault), 'danger small'));
+    append(cols, policy.card, append(el('div', 'vault-settings-aside'), info.card, danger)); this.content!.append(cols);
+    const listing = this.card('仓库文件', '已同步的文件和文件夹，包含空文件夹', button('恢复整个仓库', () => void this.vaultHistory(vault.id), 'subtle', 'clock'));
+    const listBody = el('div', 'card-body'); listBody.append(el('p', 'muted', '正在读取文件…')); listing.body.append(listBody); this.content!.insertBefore(listing.card, cols);
+    void this.api<{files: {fileId: string; paths: string[]; size: number; kind: string; conflicts: boolean; deleted: boolean}[]}>('/vaults/' + encodeURIComponent(vault.id) + '/files').then(result => {
       if (!listBody.isConnected) return;
       if (!result.files.length) { listBody.replaceChildren(el('p', 'muted', '这个仓库还没有同步文件。')); return; }
-      const {wrap, body} = this.table(['文件路径', '正文大小', '状态']);
-      for (const file of result.files) {
-        const row = el('tr'), nameCell = el('td');
-        nameCell.append(button(file.paths.join(' / '), () => void (file.deleted ? this.fileHistory(vault.id, file.fileId) : this.filePreview(vault.id, file.fileId)), 'link'));
-        append(row, nameCell, el('td', '', size(file.size)), el('td', '', file.conflicts ? '有冲突' : file.deleted ? '已删除' : '正常')); body.append(row);
+      const toolbar = el('div', 'card-toolbar'), search = el('input', 'input'), filter = el('select', 'select');
+      search.type = 'search'; search.placeholder = '搜索文件路径'; search.setAttribute('aria-label', '搜索文件路径');
+      filter.setAttribute('aria-label', '文件状态');
+      for (const [value, label] of [['current', '当前文件'], ['conflict', '有冲突'], ['deleted', '已删除'], ['all', '全部文件']]) {
+        const option = el('option', '', label); option.value = value; filter.append(option);
       }
-      listBody.replaceChildren(wrap);
+      append(toolbar, search, filter);
+      const {wrap, body} = this.table(['文件路径', '大小', '状态']);
+      const update = () => {
+      body.replaceChildren();
+      for (const file of result.files) {
+        if (!file.paths.some(path => path.toLowerCase().includes(search.value.trim().toLowerCase()))) continue;
+        if (filter.value === 'current' && file.deleted || filter.value === 'deleted' && !file.deleted || filter.value === 'conflict' && !file.conflicts) continue;
+        const row = el('tr'), nameCell = el('td');
+        nameCell.append(button(file.paths.join(' / ') + (file.kind === 'directory' ? '/' : ''), () => void (file.deleted ? this.fileHistory(vault.id, file.fileId) : this.filePreview(vault.id, file.fileId)), 'link'));
+        append(row, nameCell, el('td', '', file.kind === 'directory' ? '文件夹' : size(file.size)), el('td', '', file.conflicts ? '有冲突' : file.deleted ? '已删除' : '正常')); body.append(row);
+      }
+      if (!body.children.length) { const cell = el('td', 'muted', '没有符合条件的文件'); cell.colSpan = 3; body.append(append(el('tr'), cell)); }
+      };
+      search.addEventListener('input', update); filter.addEventListener('change', update); update();
+      listBody.replaceChildren(toolbar, wrap);
     }).catch(error => { if (listBody.isConnected) listBody.replaceChildren(el('p', 'muted', error instanceof Error ? error.message : '读取失败')); });
     const linked = this.card('连接到这个仓库的设备', '每台设备使用自己的连接码和凭证', button('查看设备管理', () => { this.deviceFilter = vault.id; this.navigate('devices'); }, 'link'));
-    linked.body.append(this.deviceTable(this.overview!.devices.filter(d => d.vault_id === vault.id))); this.content!.append(linked.card);
+    linked.body.append(this.deviceTable(this.overview!.devices.filter(d => d.vault_id === vault.id))); this.content!.insertBefore(linked.card, cols);
+    const summary = el('div', 'vault-summary');
+    for (const [label, value] of [['文件 / 文件夹', `${count(vault.files)} / ${count(vault.directories ?? 0)}`], ['设备', count(vault.devices)], ['冲突', count(vault.conflicts)], ['文件占用', size(vault.bytes)]]) {
+      append(summary, append(el('div', 'vault-summary-item'), el('span', '', label), el('strong', '', value)));
+    }
+    const sections = el('nav', 'vault-sections'); sections.setAttribute('aria-label', '仓库管理');
+    const records = this.card('同步记录', '这个仓库最近的文件变更', button('全部记录', () => { this.activityFilter = vault.id; this.activity = undefined; this.navigate('activity'); }, 'link'));
+    records.body.append(el('div', 'loading', '正在读取记录…')); this.content!.append(records.card);
+    void this.api<ActivityPage>('/activity?' + new URLSearchParams({vaultId: vault.id, limit: '20'})).then(page => {
+      if (records.body.isConnected) records.body.replaceChildren(this.activityTable(page.items));
+    }).catch(error => { if (records.body.isConnected) records.body.replaceChildren(el('p', 'error-panel', error instanceof Error ? error.message : '读取失败，请刷新重试')); });
+    const choices: ['files' | 'activity' | 'devices' | 'settings', string, HTMLElement][] = [
+      ['files', '文件', listing.card], ['activity', '同步记录', records.card], ['devices', '客户端', linked.card], ['settings', '仓库设置', cols],
+    ];
+    const updateSections = () => {
+      for (const [key, , panel] of choices) panel.hidden = key !== this.vaultSection;
+      for (const item of Array.from(sections.querySelectorAll<HTMLButtonElement>('button'))) {
+        const active = item.dataset.section === this.vaultSection;
+        item.classList.toggle('active', active); item.setAttribute('aria-pressed', String(active));
+      }
+    };
+    for (const [key, label] of choices) {
+      const item = el('button', 'vault-section', label); item.type = 'button'; item.dataset.section = key;
+      item.addEventListener('click', () => { this.vaultSection = key; updateSections(); }); sections.append(item);
+    }
+    this.content!.insertBefore(summary, listing.card); this.content!.insertBefore(sections, listing.card); updateSections();
   }
 
   private archiveVaultDialog(vault: VaultSummary) {
-    const modal = this.openDialog('移除仓库', '该仓库会从管理页面移除，关联设备将无法同步。服务端保留数据和历史，误操作后需要管理员协助恢复。', true);
-    const input = el('input', 'input'); input.setAttribute('aria-label', '输入仓库名称'); input.placeholder = vault.name;
-    modal.body.append(el('p', '', `输入仓库名称“${vault.name}”确认移除。`), input);
-    const confirm = button('确认移除', () => void this.run(async () => {
-      if (input.value !== vault.name) throw new Error('请输入完整仓库名称');
-      await this.api('/vaults/' + encodeURIComponent(vault.id) + '/archive', 'POST', {name: input.value});
-      modal.dialog.close(); this.selectedVault = ''; await this.loadOverview(); this.navigate('vaults'); toast('仓库已移除，原数据保留在服务端');
-    }, confirm), 'primary');
-    modal.actions.append(button('取消', () => modal.dialog.close()), confirm);
+    const modal = this.openDialog('永久删除仓库', '将永久清除这个仓库的全部服务端文件、历史版本、同步记录和连接凭证。此操作不可恢复。');
+    const form = el('form'), label = el('label', 'field-label', '输入完整仓库名称以确认'), input = el('input', 'input');
+    input.id = 'delete-vault-name'; label.htmlFor = input.id; input.autocomplete = 'off'; input.spellcheck = false; input.required = true;
+    const expected = el('p', 'delete-vault-name', vault.name);
+    const help = el('p', 'field-help', '名称必须完全一致。客户端本地笔记及外部备份不会删除。数据库磁盘空间将在后台整理后回收。');
+    help.id = 'delete-vault-help'; input.setAttribute('aria-describedby', help.id);
+    append(form, expected, label, input, help); modal.body.append(form);
+    const confirm = button('永久删除仓库', () => { void submit(); }, 'danger');
+    const update = () => { confirm.disabled = input.readOnly || input.value !== vault.name; };
+    const submit = async () => {
+      if (confirm.disabled || input.value !== vault.name) return;
+      await this.run(async () => {
+        input.readOnly = true;
+        try {
+          await this.api('/vaults/' + encodeURIComponent(vault.id) , 'DELETE', {name: input.value, confirm: 'permanent'});
+          this.drafts.delete(vault.id); this.activity = undefined;
+          if (this.activityFilter === vault.id) this.activityFilter = '';
+          if (this.deviceFilter === vault.id) this.deviceFilter = '';
+          modal.dialog.close(); this.selectedVault = '';
+          await this.loadOverview(false); this.navigate('vaults'); toast('仓库及服务端数据已永久删除');
+        } finally { input.readOnly = false; }
+      }, confirm);
+      update();
+    };
+    input.addEventListener('input', update); form.addEventListener('submit', event => { event.preventDefault(); void submit(); });
+    modal.actions.append(button('取消', () => modal.dialog.close()), confirm); update(); input.focus();
   }
 
   private async vaultHistory(vaultId: string) {
@@ -413,12 +450,12 @@ class Manager {
   }
 
   private async filePreview(vaultId: string, fileId: string) {
-    const modal = this.openDialog('文件预览', '只读查看服务器上的 Markdown 内容', true);
+    const modal = this.openDialog('文件预览', '只读查看云端文件', true);
     modal.body.append(el('p', 'muted', '正在读取…'));
     try {
-      const file = await this.api<{path: string; content: string}>('/vaults/' + encodeURIComponent(vaultId) + '/files/' + encodeURIComponent(fileId));
+      const file = await this.api<{path: string; content: string | null; kind: string}>('/vaults/' + encodeURIComponent(vaultId) + '/files/' + encodeURIComponent(fileId));
       if (!modal.dialog.open) return;
-      modal.body.replaceChildren(el('h3', '', file.path), el('pre', 'code-block', file.content));
+      modal.body.replaceChildren(el('h3', '', file.path), el('pre', 'code-block', file.content ?? (file.kind === 'directory' ? '这是一个文件夹。' : '二进制附件不提供文字预览，同步时会完整保留原始文件。')));
     } catch (error) {
       if (modal.dialog.open) modal.body.replaceChildren(el('p', '', error instanceof Error ? error.message : '读取失败'));
     }
@@ -450,9 +487,9 @@ class Manager {
     const modal = this.openDialog('查看旧版本', '恢复会生成新版本，现有版本和历史都会保留。', true);
     modal.body.append(el('p', 'muted', '正在读取…'));
     try {
-      const value = await this.api<{revision: {path: string; deleted: boolean}; content: string | null}>('/vaults/' + encodeURIComponent(vaultId) + '/files/' + encodeURIComponent(fileId) + '/history?revisionId=' + encodeURIComponent(revisionId));
+      const value = await this.api<{revision: {path: string; deleted: boolean}; content: string | null; kind: string}>('/vaults/' + encodeURIComponent(vaultId) + '/files/' + encodeURIComponent(fileId) + '/history?revisionId=' + encodeURIComponent(revisionId));
       if (!modal.dialog.open) return;
-      modal.body.replaceChildren(el('h3', '', value.revision.path), el('pre', 'code-block', value.revision.deleted ? '这是一个删除版本。恢复后，该文件将被删除。' : value.content ?? ''));
+      modal.body.replaceChildren(el('h3', '', value.revision.path), el('pre', 'code-block', value.revision.deleted ? '这是一个删除版本。恢复后，该文件将被删除。' : value.content ?? (value.kind === 'directory' ? '这是一个文件夹版本。' : '二进制附件不提供文字预览。')));
       const confirm = button('确认恢复为新版本', () => void this.run(async () => {
         await this.api('/vaults/' + encodeURIComponent(vaultId) + '/files/' + encodeURIComponent(fileId) + '/restore', 'POST', { revisionId, expectedHeads: heads });
         modal.dialog.close(); await this.loadOverview(); toast('已创建恢复版本，设备将在下次同步时接收');
@@ -467,7 +504,7 @@ class Manager {
     select.value = value; select.addEventListener('change', () => onChange(select.value)); return select;
   }
   private renderActivity() {
-    this.head('同步记录', '查看服务端已接收的文件变更，支持按仓库筛选。', this.refreshButton());
+    this.head('同步记录', '', this.refreshButton());
     const card = this.card('文件变更记录', '正文内容和设备凭证不会展示在这里'), toolbar = el('div', 'card-toolbar');
     append(toolbar, this.vaultFilter(this.activityFilter, value => { this.activityFilter = value; this.activity = undefined; void this.run(() => this.loadActivity()); }, '筛选记录的仓库'), el('span', 'muted small-text', '最近的变更在前'));
     card.body.append(toolbar); const rows = el('div'); rows.id = 'activity-rows'; card.body.append(rows); this.content!.append(card.card);
@@ -498,7 +535,7 @@ class Manager {
   }
   private activityTable(items: ActivityItem[], compact = false) {
     if (!items.length) return this.empty('还没有同步记录', '连接设备并提交笔记变更后，记录会显示在这里。', 'activity');
-    const { wrap, body } = this.table(compact ? ['文件 / 操作', '仓库', '时间'] : ['操作', '文件路径', '仓库', '设备', '正文大小', '时间']);
+    const { wrap, body } = this.table(compact ? ['文件 / 操作', '仓库', '时间'] : ['操作', '文件路径', '仓库', '设备', '大小', '时间']);
     const labels: Record<ActivityItem['action'], string> = { create: '新增', update: '更新', rename: '移动', delete: '删除', resolve: '解决冲突' };
     for (const item of items) {
       const row = el('tr'), action = el('span', 'action-tag ' + item.action, labels[item.action] ?? '变更'); action.prepend(icon(item.action === 'delete' ? 'close' : item.action === 'resolve' ? 'check' : 'file'));
@@ -514,7 +551,7 @@ class Manager {
   }
 
   private renderDevices() {
-    this.head('设备管理', '查看设备授权；遗失或停用的设备可以单独撤销。', this.refreshButton());
+    this.head('客户端', '', this.refreshButton(), button('安装 / 更新并连接', () => this.clientSetupDialog(), 'primary', 'plus'));
     const card = this.card('连接设备', '授权状态与实时在线状态不同'), toolbar = el('div', 'card-toolbar');
     append(toolbar, this.vaultFilter(this.deviceFilter, value => { this.deviceFilter = value; this.renderContent(); }, '筛选设备的仓库'), el('span', 'muted small-text', `${count(this.overview!.devices.filter(d => !d.revoked).length)} 台已授权`));
     card.body.append(toolbar, this.deviceTable(this.overview!.devices.filter(d => !this.deviceFilter || d.vault_id === this.deviceFilter))); this.content!.append(card.card);
@@ -527,6 +564,7 @@ class Manager {
       const row = el('tr'), name = el('td'), label = el('div', 'name-cell'), text = el('div'); append(text, el('strong', '', device.name || '未命名设备'), el('div', 'subline mono', device.id.slice(0, 8))); append(label, append(el('span', 'folder-icon'), icon('devices')), text); name.append(label);
       const repo = this.overview!.vaults.find(v => v.id === device.vault_id), recent = device.lastSeenAt ? date(device.lastSeenAt) : '本次启动后暂无记录';
       const state = el('td'); state.append(device.revoked ? badge('已撤销') : badge('已授权', 'green')); const action = el('td', 'align-right');
+      if (!device.revoked && repo) action.append(button('安装 / 更新', () => void this.inviteDialog(repo), 'small'));
       if (!device.revoked) action.append(button('撤销授权', () => this.revokeDialog(device), 'small danger'));
       else action.append(el('span', 'muted', '—'));
       append(row, name, el('td', '', repo?.name ?? device.vault_id.slice(0, 8)), el('td', 'muted', recent), state, action); body.append(row);
@@ -536,7 +574,7 @@ class Manager {
 
   private renderSettings() {
     const data = this.overview!;
-    this.head('服务设置', '查看当前服务信息和管理入口。', this.refreshButton());
+    this.head('服务设置', '', this.refreshButton());
     const grid = el('div', 'settings-grid'), info = this.card('服务信息'), body = el('div', 'card-body');
     append(body, this.infoList([['服务状态', '数据库连接正常'], ['网关版本', data.version || '—'], ['数据库', data.backend === 'couchdb' ? 'CouchDB' : data.backend], ['同步协议', String(data.protocol)], ['运行时间', uptime(data.uptimeSeconds)], ['服务标识', data.serverId]])); info.body.append(body);
     const access = this.card('管理员访问'), accessBody = el('div', 'card-body');
@@ -566,8 +604,20 @@ class Manager {
     form.addEventListener('submit', e => { e.preventDefault(); submit.click(); }); append(modal.actions, button('取消', () => modal.dialog.close()), submit); input.focus(); input.select();
   }
 
+  private clientSetupDialog() {
+    if (!this.overview!.vaults.length) { this.vaultNameDialog(); return; }
+    const modal = this.openDialog('安装 / 更新并连接', '选择目标仓库，生成适用于首次安装和已有插件更新的通用命令。');
+    const label = el('label', 'field-label', '目标仓库'), select = el('select', 'input'); select.id = 'client-vault'; label.htmlFor = select.id;
+    for (const vault of this.overview!.vaults) { const option = el('option', '', vault.name); option.value = vault.id; select.append(option); }
+    if (this.deviceFilter) select.value = this.deviceFilter;
+    append(modal.body, label, select, el('p', 'field-help', '未连接的笔记库会自动写入连接配置；已有连接时可选择仅更新或备份后切换仓库。运行前请退出 Obsidian。'));
+    modal.actions.append(button('取消', () => modal.dialog.close()), button('生成命令', () => {
+      const vault = this.overview!.vaults.find(v => v.id === select.value); if (vault) void this.inviteDialog(vault);
+    }, 'primary'));
+  }
+
   private async inviteDialog(vault: VaultSummary) {
-    const modal = this.openDialog('连接新设备', vault.name + ' · 为每台设备单独生成邀请', true); modal.body.append(el('div', 'loading', '正在生成一次性连接信息…'));
+    const modal = this.openDialog('安装 / 更新并连接', vault.name + ' · 一条命令，自动安装或更新插件', true); modal.body.append(el('div', 'loading', '正在生成一次性连接信息…'));
     try {
       const invitation = await this.api<Invitation>('/vaults/' + encodeURIComponent(vault.id) + '/invites', 'POST', { server: location.origin });
       if (!modal.dialog.open) return;
@@ -578,17 +628,17 @@ class Manager {
       const hint = el('p', 'section-note');
       const update = () => {
         for (const b of Array.from(tabs.querySelectorAll<HTMLButtonElement>('button'))) { const selected = b.dataset.tab === current; b.classList.toggle('active', selected); b.setAttribute('aria-pressed', String(selected)); }
-        code.textContent = value(); hint.textContent = current === 'code' ? '插件已安装时，打开插件设置并粘贴这段完整连接码。' : current === 'mac' ? '在要连接的 Mac 上打开“终端”，粘贴下面的整条命令。' : '在要连接的 Windows 电脑上打开 PowerShell，粘贴下面的整条命令。';
+        code.textContent = value(); hint.textContent = current === 'code' ? '仅连接码不会更新插件。需要同时安装或更新，请使用 Windows 或 macOS 命令。' : current === 'mac' ? '在要连接的 Mac 上打开“终端”，粘贴下面的整条命令。' : '在要连接的 Windows 电脑上打开 PowerShell，粘贴下面的整条命令。';
       };
       for (const [key, label] of choices) { const b = el('button', 'invite-tab', label); b.type = 'button'; b.dataset.tab = key; b.addEventListener('click', () => { current = key; update(); }); tabs.append(b); }
       const copyButton = button('复制', () => void this.run(() => copy(value()), copyButton), 'primary small', 'copy');
       const expiry = el('span', '', `有效期至 ${date(invitation.expires, true)}`), steps = el('ol', 'steps');
-      for (const text of ['在 Obsidian 中创建或打开目标笔记库。', '首次安装或更新都运行这条命令；更新前请退出 Obsidian，并选择原来的笔记库。', '已连接的笔记库会保留原连接；新接入时在第三方插件中启用 LAN Note Sync，查看首次同步预览。']) steps.append(el('li', '', text));
+      for (const text of ['先在 Obsidian 创建或打开目标笔记库，然后退出 Obsidian。', '执行命令并选择该笔记库，自动下载并校验服务端提供的插件版本。', '未连接时自动写入本仓库的连接配置；已连接时会显示当前仓库，让你选择保留连接或备份后切换。', '重新打开 Obsidian。首次使用需启用 LAN Note Sync，并确认首次同步预览。']) steps.append(el('li', '', text));
       modal.body.replaceChildren(tabs, hint, code, append(el('div', 'invite-info'), expiry, copyButton), steps);
       const download = el('a', 'button small', '下载插件 ZIP（手动安装）'); download.href = '/install/plugin.zip'; download.download = 'lan-note-sync.zip';
       const manual = el('p', 'section-note', '也可以下载 ZIP，解压到目标笔记库的 .obsidian/plugins/ 目录，在 Obsidian 启用插件，然后在“连接码”页复制并粘贴连接码。');
       modal.body.append(download, manual);
-      const note = el('div', 'notice'); append(note, icon('clock'), el('span', '', '连接信息 10 分钟有效，限首次认领设备使用。新设备请重新生成，长期设备凭证不会显示在这里。')); modal.body.append(el('div', 'divider'), note);
+      const note = el('div', 'notice'); append(note, icon('clock'), el('span', '', '首次连接需在 10 分钟内完成，每台新设备单独生成命令。已有连接时，只有明确选择并确认切换才会更换仓库。')); modal.body.append(el('div', 'divider'), note);
       append(modal.actions, button('关闭', () => modal.dialog.close()), button('为另一台设备生成', () => void this.inviteDialog(vault), '', 'refresh')); update();
     } catch (e) {
       if (e instanceof ApiError && e.status === 401) { this.closeDialog(); this.authenticated = false; this.csrf = ''; this.renderLogin(false, '登录已过期，请重新登录'); return; }

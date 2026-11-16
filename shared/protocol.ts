@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 
-export const PROTOCOL = 2;
+export const PROTOCOL = 3;
+export type NodeKind = 'file' | 'directory';
 export const MAX_BYTES = 5 * 1024 * 1024;
 export const MAX_FILES = 10000;
 export const id = () => randomUUID();
@@ -15,6 +16,7 @@ export class SyncError extends Error {
 }
 
 export interface Revision {
+  kind?: NodeKind;
   id: string;
   fileId: string;
   parents: string[];
@@ -54,8 +56,8 @@ export function assertHash(value: unknown): asserts value is string {
   if (typeof value !== 'string' || !/^[a-f0-9]{64}$/.test(value)) throw new SyncError('invalid_hash', '内容哈希无效', 400);
 }
 export function validatePath(value: unknown): string {
-  if (typeof value !== 'string' || value.length > 512 || value !== value.normalize('NFC') || !value.endsWith('.md')) {
-    throw new SyncError('invalid_path', '仅支持 NFC 格式的相对 .md 路径（最长 512 字符）', 400);
+  if (typeof value !== 'string' || value.length > 512 || value !== value.normalize('NFC')) {
+    throw new SyncError('invalid_path', '仅支持 NFC 格式的相对路径（最长 512 字符）', 400);
   }
   const segments = value.split('/');
   if (segments.some(s => !s || s.startsWith('.') || s !== s.trim() || /[. ]$/.test(s) ||
@@ -70,10 +72,21 @@ export function pathsOverlap(a: string, b: string): boolean {
   const x = pathKey(a), y = pathKey(b);
   return x === y || x.startsWith(y + '/') || y.startsWith(x + '/');
 }
+export function nodesOverlap(a: Pick<Revision, 'path' | 'kind'>, b: Pick<Revision, 'path' | 'kind'>): boolean {
+  const ap = a.path.split('/'), bp = b.path.split('/');
+  for (let i = 0; i < Math.min(ap.length, bp.length); i++) {
+    if (pathKey(ap[i]) !== pathKey(bp[i])) break;
+    if (ap[i] !== bp[i]) return true; // Shared parents must have identical casing on every platform.
+  }
+  const x = pathKey(a.path), y = pathKey(b.path);
+  return x === y || (x.startsWith(y + '/') && b.kind !== 'directory') || (y.startsWith(x + '/') && a.kind !== 'directory');
+}
 export function validateRevision(input: unknown): Revision {
   const r = input as Revision;
   if (!r || typeof r !== 'object') throw new SyncError('invalid_revision', '修订无效', 400);
   assertId(r.id); assertId(r.fileId); assertId(r.clientId); validatePath(r.path);
+  if (r.kind !== undefined && r.kind !== 'file' && r.kind !== 'directory') throw new SyncError('invalid_kind', '节点类型无效', 400);
+  if (r.kind === 'directory' && (r.size !== 0 || (!r.deleted && r.hash !== hash(Buffer.alloc(0))))) throw new SyncError('invalid_directory', '目录不能包含文件内容', 400);
   if (!Array.isArray(r.parents) || r.parents.length > 32 || new Set(r.parents).size !== r.parents.length) {
     throw new SyncError('invalid_parents', '父修订列表无效', 400);
   }
@@ -86,5 +99,5 @@ export function validateRevision(input: unknown): Revision {
   } else assertHash(r.hash);
   // Canonical shape: no caller-controlled extra properties in idempotency comparisons.
   return { id: r.id, fileId: r.fileId, parents: [...r.parents].sort(), path: r.path,
-    deleted: r.deleted, hash: r.hash, size: r.size, clientId: r.clientId };
+    deleted: r.deleted, hash: r.hash, size: r.size, clientId: r.clientId, ...(r.kind === 'directory' ? {kind: 'directory'} : {}) };
 }

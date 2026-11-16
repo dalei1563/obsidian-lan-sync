@@ -251,9 +251,17 @@ export default class LanSyncPlugin extends Plugin {
     try {
       const state = this.disk.load() ?? newState(this.settings.serverId, this.settings.vaultId, this.settings.deviceId);
       if (state.serverId !== this.settings.serverId || state.vaultId !== this.settings.vaultId || state.clientId !== this.settings.deviceId) throw new Error('绑定与本地基线不匹配，已停止同步');
+      const expandedScope = state.initialized && state.treeVersion !== 1;
+      if (expandedScope) {
+        // The old baseline covered Markdown only. Do not upload previously
+        // ignored attachments or folders before the user chooses a direction.
+        this.settings.enabled = false; await this.saveSettings();
+        state.treeVersion = 1; await this.disk.save(state);
+        new Notice('已支持附件和文件夹同步。自动同步已暂停，请先选择并预览覆盖方向。', 10000);
+      }
       this.local = new ObsidianVault(this.app, this.disk);
       this.engine = new Engine(new Remote(url, this.settings.vaultId, token, this.transport), this.local, state, s => this.disk!.save(s), m => this.setStatus(m), { excludedPaths: () => this.settings.excludedPaths, configDir: this.app.vault.configDir });
-      this.setStatus(state.overwrite ? '覆盖尚未完成，请在设置中重新预览' : !state.initialized ? '已配对，等待首次同步预览' : this.settings.enabled ? '等待同步' : '自动同步已暂停');
+      this.setStatus(expandedScope ? '同步范围已扩展，请先选择并预览覆盖方向' : state.overwrite ? '覆盖尚未完成，请在设置中重新预览' : !state.initialized ? '已配对，等待首次同步预览' : this.settings.enabled ? '等待同步' : '自动同步已暂停');
     } catch (e) { this.disk.close(); this.disk = undefined; throw e; }
   }
   async pair(code: string, server = this.settings.server, allowHttp = this.settings.allowHttp): Promise<void> {
@@ -287,11 +295,11 @@ export default class LanSyncPlugin extends Plugin {
     if (!this.engine) throw new Error('请先输入配对码连接服务');
     const modal = new Modal(this.app); modal.titleEl.setText('选择覆盖方向');
     modal.onClose = () => { this.previewDialog = undefined; if (!this.engine?.state.initialized && !this.disposed) this.setStatus('已配对，首次同步尚未开始'); };
-    modal.contentEl.createEl('p', { text: '请选择以哪一端为准。下一步会列出具体变化，确认之前不会修改笔记。只处理未排除的 Markdown 文件。' });
+    modal.contentEl.createEl('p', { text: '请选择以哪一端为准。下一步会列出具体变化，确认之前不会修改笔记。会对齐未排除的文件、附件和文件夹（含空文件夹）及其位置。隐藏路径、Obsidian 配置和排除项保持不变。' });
     if (this.engine.state.overwrite) modal.contentEl.createEl('p', { text: '上次覆盖未完成；请重新预览原方向，然后确认继续。' });
     const choose = (mode: OverwriteMode) => { modal.close(); void this.action(() => this.previewDirection(mode)); };
-    new Setting(modal.contentEl).setName('云端覆盖本地').setDesc('本地会变成云端的样子，本地独有的笔记会被删除。请提前自行备份。').addButton(b => b.setButtonText('预览云端覆盖').onClick(() => choose('cloud-to-local')));
-    new Setting(modal.contentEl).setName('本地覆盖云端').setDesc('云端会变成本地的样子，云端独有的笔记会被删除；旧版本保留在后台。').addButton(b => b.setButtonText('预览本地覆盖').onClick(() => choose('local-to-cloud')));
+    new Setting(modal.contentEl).setName('云端覆盖本地').setDesc('本地会变成云端的样子，本地多出的文件和文件夹会被删除。请提前自行备份。').addButton(b => b.setButtonText('预览云端覆盖').onClick(() => choose('cloud-to-local')));
+    new Setting(modal.contentEl).setName('本地覆盖云端').setDesc('云端会变成本地的样子，云端多出的文件和文件夹会被删除；旧版本保留在后台。').addButton(b => b.setButtonText('预览本地覆盖').onClick(() => choose('local-to-cloud')));
     this.previewDialog = modal;
     try { await this.openMainModal(modal); } catch (e) { this.previewDialog = undefined; throw e; }
   }
@@ -301,10 +309,10 @@ export default class LanSyncPlugin extends Plugin {
     const plan = await engine.previewOverwrite(mode); this.ensureActive();
     const modal = new Modal(this.app); modal.titleEl.setText(mode === 'cloud-to-local' ? '确认云端覆盖本地' : '确认本地覆盖云端');
     modal.contentEl.addClass('lan-sync-modal');
-    modal.contentEl.createEl('p', { text: `本地 ${plan.local} 篇，云端 ${plan.cloud} 篇，相同 ${plan.unchanged} 篇；将执行 ${plan.actions.length} 项变化。` });
+    modal.contentEl.createEl('p', { text: `本地 ${plan.local} 项，云端 ${plan.cloud} 项，相同 ${plan.unchanged} 项；将执行 ${plan.actions.length} 项变化。` });
     const labels = { upload: '上传 / 覆盖云端', download: '下载 / 覆盖本地', 'delete-local': '删除本地', 'delete-cloud': '删除云端' };
-    modal.contentEl.createEl('pre', { text: plan.actions.map(a => `${labels[a.type]}：${a.path}`).join('\n') || '两端已经一致。' });
-    modal.contentEl.createEl('p', { text: mode === 'cloud-to-local' ? '本地独有笔记会被删除，同名笔记会被替换。请先自行备份整个本地笔记库。' : '云端删除和覆盖都会生成新版本，历史版本可在管理员后台查看和恢复。' });
+    modal.contentEl.createEl('pre', { text: plan.actions.map(a => `${labels[a.type]}${a.kind === 'directory' ? '文件夹' : '文件'}：${a.path}`).join('\n') || '两端已经一致。' });
+    modal.contentEl.createEl('p', { text: mode === 'cloud-to-local' ? '本地多出的文件和文件夹会被删除；同名项目按云端的类型和内容替换。请先自行备份整个本地笔记库。' : '云端删除和覆盖都会生成新版本，历史版本可在管理员后台查看和恢复。' });
     let backedUp = mode !== 'cloud-to-local';
     if (!backedUp) new Setting(modal.contentEl).setName('我已自行备份本地笔记库').addToggle(t => t.onChange(value => { backedUp = value; }));
     new Setting(modal.contentEl).addButton(b => b.setButtonText('取消').onClick(() => modal.close())).addButton(b => b.setButtonText('确认并开始覆盖').setWarning().onClick(() => {
@@ -386,7 +394,7 @@ export default class LanSyncPlugin extends Plugin {
   private async previewRevision(parent: Modal, fileId: string, revision: Revision): Promise<void> {
     const data = revision.deleted ? null : await this.engine!.remote.get(revision.hash!);
     const modal = new Modal(this.app); modal.titleEl.setText(revision.deleted ? '删除版本' : revision.path); modal.contentEl.addClass('lan-sync-modal');
-    modal.contentEl.createEl('pre', { text: data ? data.toString('utf8').slice(0, 12000) : '此版本表示删除；选择后文件会进入回收站。' });
+    modal.contentEl.createEl('pre', { text: revision.kind === 'directory' ? (revision.deleted ? '此版本表示删除文件夹。' : '这是一个文件夹版本。') : data ? (!data.includes(0) && Buffer.from(data.toString('utf8')).equals(data) ? data.toString('utf8').slice(0, 12000) : '二进制附件不提供文字预览，选择后会保留原始字节。') : '此版本表示删除；选择后文件会进入回收站。' });
     new Setting(modal.contentEl).addButton(b => b.setButtonText('选择这个版本').setCta().onClick(() => { modal.close(); this.confirmResolution(parent, fileId, revision, revision.id.slice(0, 8)); })); modal.open();
   }
 }

@@ -65,7 +65,7 @@ test('admin manages isolated repositories, invites, change records, exclusions a
   const data = Buffer.from('hello'), revision = { id: id(), fileId: id(), parents: [], path: 'note.md', deleted: false, hash: hash(data), size: data.length, clientId: pair.deviceId };
   f.store.putObject(a.id, hash(data), data); f.store.commit(a.id, revision, pair.deviceId);
   const files = await f.request(`/admin/api/vaults/${a.id}/files`);
-  assert.equal(files.status, 200); assert.deepEqual(files.value.files, [{ fileId: revision.fileId, paths: ['note.md'], size: data.length, conflicts: false, deleted: false }]);
+  assert.equal(files.status, 200); assert.deepEqual(files.value.files, [{ fileId: revision.fileId, kind: 'file', paths: ['note.md'], size: data.length, conflicts: false, deleted: false }]);
   const preview = await f.request(`/admin/api/vaults/${a.id}/files/${revision.fileId}`);
   assert.equal(preview.status, 200); assert.equal(preview.value.content, 'hello'); assert.equal(preview.value.path, 'note.md');
   assert.equal((await f.request(`/admin/api/vaults/${b.id}/files/${revision.fileId}`)).status, 404);
@@ -94,6 +94,36 @@ test('admin manages isolated repositories, invites, change records, exclusions a
   assert.equal((await f.request('/admin/api/devices/' + pair.deviceId + '/revoke', 'POST')).status, 200);
   assert.equal((await f.request(`/v1/vaults/${a.id}/state`, 'GET', undefined, { Authorization: 'Bearer ' + pair.token })).status, 401);
   assert.equal((await f.request('/admin/api/devices/missing-device/revoke', 'POST')).status, 404);
+});
+
+test('admin vault deletion requires the exact name and disables existing connections', async t => {
+  const f = await setup(t); await f.login();
+  const vault = (await f.request('/admin/api/vaults', 'POST', {name: '确认删除的仓库'})).value.vault;
+  const invitation = (await f.request(`/admin/api/vaults/${vault.id}/invites`, 'POST', {server: f.url})).value;
+  const device = f.store.pair(decodeConnection(invitation.connection).code, 'Existing device');
+  const endpoint = `/admin/api/vaults/${vault.id}/archive`;
+  for (const name of [undefined, '', '确认删除', '确认删除的仓库 ']) {
+    assert.equal((await f.request(endpoint, 'POST', {name})).status, 400);
+    assert.equal((await f.request(`/v1/vaults/${vault.id}/state`, 'GET', undefined, {Authorization: 'Bearer ' + device.token})).status, 200);
+  }
+  assert.equal((await f.request(endpoint, 'POST', {name: vault.name})).status, 200);
+  const overview = (await f.request('/admin/api/overview')).value;
+  assert.equal(overview.vaults.some((v: {id: string}) => v.id === vault.id), false);
+  assert.equal(overview.devices.some((d: {id: string}) => d.id === device.deviceId), false);
+  assert.equal((await f.request(`/v1/vaults/${vault.id}/state`, 'GET', undefined, {Authorization: 'Bearer ' + device.token})).status, 401);
+  assert.equal((await f.request(endpoint, 'POST', {name: vault.name})).status, 404);
+});
+
+test('permanent delete requires explicit intent and exact name, and removes stored data', async t => {
+  const f = await setup(t); await f.login();
+  const vault = (await f.request('/admin/api/vaults', 'POST', {name: '永久删除'})).value.vault;
+  const endpoint = `/admin/api/vaults/${vault.id}`;
+  assert.equal((await f.request(endpoint, 'DELETE', {name: vault.name})).status, 400);
+  assert.equal((await f.request(endpoint, 'DELETE', {name: '错误', confirm: 'permanent'})).status, 400);
+  assert.equal((await f.request(endpoint, 'DELETE', {name: vault.name, confirm: 'permanent'}, {'X-CSRF-Token': ''})).status, 403);
+  assert.equal((await f.request(endpoint, 'DELETE', {name: vault.name, confirm: 'permanent'})).status, 200);
+  assert.equal(f.store.db.prepare('SELECT id FROM vaults WHERE id=?').get(vault.id), undefined);
+  assert.equal((await f.request(endpoint, 'DELETE', {name: vault.name, confirm: 'permanent'})).status, 404);
 });
 
 test('admin login is rate limited and ignores spoofed forwarded IPs', async t => {
@@ -161,4 +191,23 @@ test('unconfigured admin stays closed while sync health and self-hosted login as
 
 test('admin can mark session cookies Secure for TLS-terminating reverse proxies', async t => {
   const f = await setup(t, 'test-admin-password', true); const r = await f.login(); assert.match(r.headers.get('set-cookie')!, /; Secure/);
+});
+
+
+test('admin distinguishes directories and binary attachments and restores directory history', async t => {
+  const f = await setup(t); await f.login();
+  const pair = f.store.pair(f.store.createPair('Tree').code, 'device');
+  const put = (path: string, bytes: Buffer, kind?: 'directory') => {
+    f.store.putObject(pair.vaultId, hash(bytes), bytes);
+    return f.store.commit(pair.vaultId, {id: id(), fileId: id(), parents: [], path, kind, deleted: false, hash: hash(bytes), size: bytes.length, clientId: pair.deviceId}, pair.deviceId).revision;
+  };
+  const folder = put('empty', Buffer.alloc(0), 'directory'), binary = put('photo.png', Buffer.from([255,0,128]));
+  const files = (await f.request(`/admin/api/vaults/${pair.vaultId}/files`)).value.files;
+  assert.equal(files.find((v: any) => v.fileId === folder.fileId).kind, 'directory');
+  const preview = (await f.request(`/admin/api/vaults/${pair.vaultId}/files/${binary.fileId}`)).value;
+  assert.equal(preview.kind, 'binary'); assert.equal(preview.content, null);
+  const summary = (await f.request('/admin/api/overview')).value.vaults[0]; assert.equal(summary.files, 1); assert.equal(summary.directories, 1);
+  const removed = f.store.commit(pair.vaultId, {...folder, id: id(), parents: [folder.id], deleted: true, hash: null, size: 0}, pair.deviceId).revision;
+  const restored = await f.request(`/admin/api/vaults/${pair.vaultId}/files/${folder.fileId}/restore`, 'POST', {revisionId: folder.id, expectedHeads: [removed.id]});
+  assert.equal(restored.status, 201); assert.equal(restored.value.revision.kind, 'directory');
 });

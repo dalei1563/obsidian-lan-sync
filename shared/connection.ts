@@ -6,10 +6,11 @@ export function connectionUrl(value: string): string {
   if (!['https:', 'http:'].includes(u.protocol) || u.username || u.password || u.search || u.hash || u.pathname !== '/') throw new Error('连接地址无效，请从管理员提供的完整连接码导入');
   return u.origin;
 }
-export function encodeConnection(server: string, code: string): string {
+export function encodeConnection(server: string, code: string, target?: {id: string; name: string}): string {
   const c: Connection = { protocol: PROTOCOL, server: connectionUrl(server), code };
   if (!/^[a-f0-9]{24}$/.test(code)) throw new Error('Invalid pairing code');
-  return 'lansync:' + Buffer.from(JSON.stringify(c)).toString('base64url');
+  if (target) assertId(target.id);
+  return 'lansync:' + Buffer.from(JSON.stringify({...c, ...(target ? {vaultId: target.id, vaultLabel: Buffer.from(target.name, 'utf8').toString('base64')} : {})})).toString('base64url');
 }
 export function decodeConnection(value: string): Connection {
   let raw = value.trim();

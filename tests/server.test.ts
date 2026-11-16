@@ -43,7 +43,7 @@ test('binary objects preserve Chinese, BOM, CRLF and zero bytes; corrupt bytes r
     await f.remoteA.put(data, hash(data)); assert.deepEqual(await f.remoteA.get(hash(data)), data);
   }
   await assert.rejects(f.remoteA.put(Buffer.from('wrong'), hash('right')), /哈希/);
-  const invalid = Buffer.from([0xff]); await assert.rejects(f.remoteA.put(invalid, hash(invalid)), /UTF-8/);
+  const binary = Buffer.from([0xff, 0, 0x80]); await f.remoteA.put(binary, hash(binary)); assert.deepEqual(await f.remoteA.get(hash(binary)), binary);
   // Upload in another vault cannot expose an object under the same hash.
   const other = f.store.pair(f.store.createPair('Other').code, 'other');
   assert.throws(() => f.store.getObject(other.vaultId, hash(Buffer.alloc(0))), /不存在/);

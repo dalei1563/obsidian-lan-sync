@@ -33,6 +33,11 @@ export async function fixture(t: TestContext, distribution?: Distribution) {
 }
 export class MemoryVault implements LocalVault {
   files = new Map<string, Buffer>();
+  directories = new Set<string>();
+  tree = false;
+  kind(path: string) { return this.directories.has(path) ? "directory" as const : "file" as const; }
+  mkdir(path: string) { this.tree = true; this.directories.add(path); this.files.set(path, Buffer.alloc(0)); this.parents(path); }
+  private parents(path: string) { if (!this.tree) return; const parts = path.split("/"); parts.pop(); while(parts.length) { const p = parts.join("/"); this.directories.add(p); this.files.set(p, Buffer.alloc(0)); parts.pop(); } }
   preserved: Buffer[] = [];
   trash: Buffer[] = [];
   beforeApply?: () => void;
@@ -42,13 +47,14 @@ export class MemoryVault implements LocalVault {
   async apply(r: ApplyRequest) {
     this.beforeApply?.();
     const current = this.files.get(r.oldPath);
-    if ((current ? hash(current) : null) !== r.expectedHash) throw new Error('Local changed during download');
-    if (r.path !== r.oldPath && this.files.has(r.path)) throw new Error('Target occupied');
+    if ((current ? hash(current) : null) !== r.expectedHash || (current && this.kind(r.oldPath) !== (r.expectedKind ?? 'file'))) throw new Error('Local changed during download');
+    if (r.path !== r.oldPath && this.files.has(r.path) && !(r.kind === 'directory' && this.directories.has(r.path))) throw new Error('Target occupied');
     if (current) { this.preserved.push(Buffer.from(current)); this.trash.push(Buffer.from(current)); }
-    this.files.delete(r.oldPath);
-    if (r.content !== null) this.files.set(r.path, Buffer.from(r.content));
+    if (this.directories.has(r.oldPath) && (r.content === null || r.path !== r.oldPath || r.kind !== 'directory') && [...this.files.keys()].some(p => p.startsWith(r.oldPath + '/'))) throw new Error('Directory not empty');
+    this.files.delete(r.oldPath); this.directories.delete(r.oldPath);
+    if (r.content !== null) { if (r.kind === 'directory') this.mkdir(r.path); else this.set(r.path, r.content); }
   }
-  set(path: string, text: string | Buffer) { this.files.set(path, Buffer.from(text)); }
+  set(path: string, text: string | Buffer) { this.directories.delete(path); this.files.set(path, Buffer.from(text)); this.parents(path); }
   text(path: string) { return this.files.get(path)?.toString('utf8'); }
 }
 export function client(remote: Remote, serverId: string, clientId: string, local = new MemoryVault(), existing?: SyncState) {

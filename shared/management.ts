@@ -6,6 +6,7 @@ export interface VaultSummary {
   name: string;
   createdAt: number | null;
   files: number;
+  directories: number;
   deletedFiles: number;
   conflicts: number;
   revisionCount: number;
@@ -42,20 +43,20 @@ export function parseActivityCursor(value: string): [string, string] {
   assertId(parts[0]); assertId(parts[1]); return [parts[0], parts[1]];
 }
 
-export function summarizeFiles(files: FileState[]): Pick<VaultSummary, 'files' | 'deletedFiles' | 'conflicts' | 'bytes'> {
-  let live = 0, deletedFiles = 0, conflicts = 0, bytes = 0;
+export function summarizeFiles(files: FileState[]): Pick<VaultSummary, 'files' | 'directories' | 'deletedFiles' | 'conflicts' | 'bytes'> {
+  let live = 0, directories = 0, deletedFiles = 0, conflicts = 0, bytes = 0;
   for (const file of files) {
     if (file.heads.length > 1) conflicts++;
     if (file.heads.every(h => h.deleted)) deletedFiles++;
     else {
-      live++;
+      if (file.heads.some(h => !h.deleted && h.kind !== 'directory')) live++; else directories++;
       // Conflicting live heads are retained data too; deduplicate identical
       // content within this logical file when estimating current-body bytes.
       const seen = new Set<string>();
       for (const h of file.heads) if (!h.deleted && h.hash && !seen.has(h.hash)) { seen.add(h.hash); bytes += h.size; }
     }
   }
-  return { files: live, deletedFiles, conflicts, bytes };
+  return { files: live, directories, deletedFiles, conflicts, bytes };
 }
 export function revisionAction(revision: Revision, parent: (id: string) => Revision | undefined): ActivityItem['action'] {
   if (revision.parents.length > 1) return 'resolve';

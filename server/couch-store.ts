@@ -1,7 +1,7 @@
 import { randomBytes, createHmac } from 'node:crypto';
 import { mkdirSync, existsSync, readFileSync, writeFileSync, appendFileSync, openSync, fsyncSync, closeSync } from 'node:fs';
 import { join, resolve, sep } from 'node:path';
-import { assertHash, assertId, Changes, CommitResult, Cursor, FileState, hash, id, MAX_BYTES, MAX_FILES, PairResult, pathsOverlap, PROTOCOL, Revision, Snapshot, SyncError, validateRevision, validCursor } from '../shared/protocol';
+import { assertHash, assertId, Changes, CommitResult, Cursor, FileState, hash, id, MAX_BYTES, MAX_FILES, PairResult, nodesOverlap, PROTOCOL, Revision, Snapshot, SyncError, validateRevision, validCursor } from '../shared/protocol';
 import type { Backend, DeviceInfo } from './backend';
 import { ActivityPage, VaultSummary, activityId, activityLimit, managementName, parseActivityCursor, revisionAction, summarizeFiles } from '../shared/management';
 import { normalizeExclusions, isExcluded } from '../shared/exclusions';
@@ -26,6 +26,7 @@ export class CouchStore implements Backend {
   private readonly files = new Map<string, Map<string, Map<string, Revision>>>();
   private tail: Promise<unknown> = Promise.resolve();
   private closed = false;
+  private readonly deleting = new Set<string>();
 
   private constructor(readonly options: CouchOptions) {
     const url = new URL(options.url);
@@ -51,6 +52,7 @@ export class CouchStore implements Backend {
     if (!meta || meta.schema !== 1 || meta.type !== 'control') throw new Error('Unsupported CouchDB storage schema');
     if (meta.owner !== owner) throw new Error('此数据库已绑定另一套网关数据目录，请恢复原数据卷；禁止同时运行多个网关写入');
     store.meta = meta; store.serverId = meta.serverId;
+    for (const vault of await store.prefix('vault:')) if (vault.deleting) await store.deleteVault(vault.vaultId, vault.name);
     await store.refresh(); return store;
   }
   private async raw(path: string, method = 'GET', body?: unknown, accepted = [200, 201, 202]): Promise<Response> {
@@ -76,6 +78,7 @@ export class CouchStore implements Backend {
   private key(vaultId: string, kind: string, value: string): string { assertId(vaultId); return `${kind}:${vaultId}:${value}`; }
   private collect(doc: Doc, seq: Cursor): void {
     if (doc.type !== 'revision') return;
+    if (this.deleting.has(doc.vaultId)) return;
     const r = validateRevision(doc.revision); assertId(doc.vaultId);
     if (doc._id !== this.key(doc.vaultId, 'revision', r.id)) throw new SyncError('couch_corrupt', '数据库版本标识不一致，已停止同步', 503);
     const key = doc._id, previous = this.records.get(key);
@@ -109,7 +112,7 @@ export class CouchStore implements Backend {
   }
   private async vault(vaultId: string): Promise<Doc> {
     assertId(vaultId); const vault = await this.doc('vault:' + vaultId);
-    if (!vault || vault.type !== 'vault' || vault.archived) throw new SyncError('vault_missing', '仓库不存在', 404);
+    if (!vault || vault.type !== 'vault' || vault.archived || vault.deleting) throw new SyncError('vault_missing', '仓库不存在', 404);
     return vault;
   }
   private async exclusions(vaultId: string): Promise<string[]> { return normalizeExclusions((await this.vault(vaultId)).excludedPaths ?? []); }
@@ -122,6 +125,44 @@ export class CouchStore implements Backend {
   }
   archiveVault(vaultId: string): Promise<void> {
     return this.serial(async () => { const vault = await this.vault(vaultId); await this.put({...vault, archived: true}); });
+  }
+  deleteVault(vaultId: string, name: string): Promise<void> {
+    return this.serial(async () => {
+      assertId(vaultId);
+      const vault = await this.doc('vault:' + vaultId);
+      if (!vault || vault.type !== 'vault') throw new SyncError('vault_missing', '仓库不存在', 404);
+      if (name !== vault.name) throw new SyncError('vault_name_mismatch', '请输入完整仓库名称', 400);
+      await this.put({...vault, deleting: true});
+      this.deleting.add(vaultId);
+      this.files.delete(vaultId);
+      for (const [key, entry] of this.records) if (entry.doc.vaultId === vaultId) this.records.delete(key);
+      // Purge is scoped by document ownership, never by a user-supplied prefix.
+      // Keep the vault intent until all owned data is gone, so restart can resume.
+      let after: string | undefined;
+      for (;;) {
+        const qs = new URLSearchParams({include_docs: 'true', conflicts: 'true', limit: '100', ...(after ? {startkey: JSON.stringify(after)} : {})});
+        const page = await (await this.raw('/_all_docs?' + qs)).json() as any;
+        const rows = page.rows.filter((row: any) => row.id !== after);
+        const owned = rows.map((row: any) => row.doc).filter((doc: Doc | undefined) => doc && doc.vaultId === vaultId && doc._id !== vault._id);
+        if (owned.length) await this.purgeDocuments(owned);
+        if (page.rows.length < 100) break;
+        const next = page.rows[page.rows.length - 1].id;
+        if (next === after) throw new Error('Deletion scan did not advance');
+        after = next;
+      }
+      // Compaction reclaims disk asynchronously; request it before removing intent.
+      await this.raw('/_compact', 'POST', {});
+      const current = await this.doc(vault._id);
+      if (current) await this.purgeDocuments([current]);
+      this.deleting.delete(vaultId);
+    });
+  }
+  private async purgeDocuments(documents: Doc[]): Promise<void> {
+    const request: Record<string, string[]> = Object.fromEntries(documents.map(doc => [doc._id, [doc._rev, ...(doc._conflicts ?? [])]]));
+    const result = await (await this.raw('/_purge', 'POST', request)).json() as any;
+    for (const [key, revisions] of Object.entries(request)) {
+      if (!revisions.every(revision => result.purged?.[key]?.includes(revision))) throw new SyncError('purge_incomplete', '删除未完成，请重试；服务重启后也会继续清理', 503);
+    }
   }
   renameVault(vaultId: string, name: string): Promise<void> {
     return this.serial(async () => { const vault = await this.vault(vaultId); await this.put({ ...vault, name: managementName(name) }); });
@@ -213,14 +254,17 @@ export class CouchStore implements Backend {
     try { await this.vault(device.vaultId); } catch (error) { if (error instanceof SyncError && error.code === 'vault_missing') throw new SyncError('unauthorized', '设备未授权或已撤销', 401); throw error; }
     return { vaultId: device.vaultId, deviceId: device.id };
   }
-  async putObject(vaultId: string, sha: string, data: Buffer): Promise<void> {
+  putObject(vaultId: string, sha: string, data: Buffer): Promise<void> {
+    return this.serial(async () => {
+    await this.vault(vaultId);
     assertHash(sha); assertId(vaultId);
-    if (data.length > MAX_BYTES || hash(data) !== sha || !Buffer.from(data.toString('utf8')).equals(data)) throw new SyncError('invalid_object', '正文超限、哈希不符或不是有效 UTF-8', 400);
+    if (data.length > MAX_BYTES || hash(data) !== sha) throw new SyncError('invalid_object', '文件超限或哈希不符', 400);
     const key = this.key(vaultId, 'object', sha), previous = await this.doc(key);
     if (previous) { const actual = await this.getObject(vaultId, sha); if (!actual.equals(data)) throw new Error('Object mismatch'); return; }
     try { await this.put({ _id: key, type: 'object', vaultId, hash: sha, size: data.length,
       _attachments: { body: { content_type: 'application/octet-stream', data: data.toString('base64') } } }); }
     catch (e) { if (!(e instanceof SyncError && e.code === 'couch_conflict')) throw e; if (!(await this.getObject(vaultId, sha)).equals(data)) throw new Error('Object mismatch'); }
+    });
   }
   async getObject(vaultId: string, sha: string): Promise<Buffer> {
     assertHash(sha); const key = this.key(vaultId, 'object', sha);
@@ -261,7 +305,7 @@ export class CouchStore implements Backend {
       if (!revision.deleted) {
         const obj = await this.doc(this.key(vaultId, 'object', revision.hash!));
         if (!obj || obj.type !== 'object' || obj.size !== revision.size || !obj._attachments?.body) throw new SyncError('object_missing', '正文尚未持久化');
-        for (const fileId of this.files.get(vaultId)?.keys() ?? []) if (fileId !== revision.fileId && this.file(vaultId, fileId).heads.some(h => !h.deleted && pathsOverlap(h.path, revision.path))) throw new SyncError('path_conflict', '目标路径已被其他逻辑文件占用');
+        for (const fileId of this.files.get(vaultId)?.keys() ?? []) if (fileId !== revision.fileId && this.file(vaultId, fileId).heads.some(h => !h.deleted && nodesOverlap(h, revision))) throw new SyncError('path_conflict', '目标路径已被其他逻辑文件占用');
       }
       const fileAfter = { fileId: revision.fileId, heads: [...existing.heads.filter(h => !revision.parents.includes(h.id)), revision].sort((a, b) => a.id.localeCompare(b.id)) };
       const doc: RevisionDoc = { _id: key, type: 'revision', vaultId, revision, fileAfter, createdAt: Date.now() };
@@ -309,7 +353,7 @@ export class CouchStore implements Backend {
     }
   }
   async devices(): Promise<DeviceInfo[]> { const active = new Set((await this.prefix('vault:')).filter(v => !v.archived).map(v => v.vaultId)); return (await this.prefix('device:')).filter(d => active.has(d.vaultId)).map(d => ({ id: d.id, vault_id: d.vaultId, name: d.name, revoked: d.revoked ? 1 : 0 })); }
-  async revoke(deviceId: string): Promise<void> { assertId(deviceId); const device = (await this.prefix('device:')).find(d => d.id === deviceId); if (!device) throw new Error('Device not found'); await this.put({ ...device, revoked: true }); }
+  revoke(deviceId: string): Promise<void> { return this.serial(async () => { assertId(deviceId); const device = (await this.prefix('device:')).find(d => d.id === deviceId); if (!device) throw new Error('Device not found'); await this.put({ ...device, revoked: true }); }); }
   async health(): Promise<void> { await this.raw(''); }
   async backup(destination: string): Promise<void> {
     const target = resolve(destination); if (target === this.root || target.startsWith(this.root + sep)) throw new Error('Backup must be outside data directory');

@@ -1,10 +1,12 @@
-import { assertHash, assertId, Cursor, FileState, hash, id, MAX_BYTES, pathKey, Revision, Snapshot, SyncError, validatePath, validateRevision } from '../../shared/protocol';
+import { NodeKind, assertHash, assertId, Cursor, FileState, hash, id, MAX_BYTES, pathKey, Revision, Snapshot, SyncError, validatePath, validateRevision } from '../../shared/protocol';
 import { Remote } from './remote';
 import { isExcluded, normalizeExclusions } from '../../shared/exclusions';
 import { planOverwrite, type OverwriteMode, type OverwritePlan } from './overwrite-plan';
 
-export interface ApplyRequest { oldPath: string; path: string; expectedHash: string | null; content: Buffer | null }
+export interface ApplyRequest { oldPath: string; path: string; expectedHash: string | null; content: Buffer | null; kind?: NodeKind; expectedKind?: NodeKind }
 export interface LocalVault {
+  kind?(path: string): NodeKind;
+  protectedDirectories?: Set<string>;
   scan(accept?: (path: string) => boolean): Promise<Map<string, Buffer>>;
   read(path: string): Promise<Buffer | null>;
   apply(request: ApplyRequest): Promise<void>;
@@ -17,6 +19,7 @@ export interface Entry {
   basePath: string;
   baseRevision: string | null;
   baseHash: string | null;
+  baseKind?: NodeKind;
   baseDeleted: boolean;
   materialized: boolean;
   blocked?: string;
@@ -24,6 +27,7 @@ export interface Entry {
 export interface Pending { revision: Revision; content: string | null; applyAfter?: boolean }
 export interface SyncState {
   schema: 1;
+  treeVersion?: 1;
   serverId: string;
   vaultId: string;
   clientId: string;
@@ -41,7 +45,7 @@ export interface SyncState {
   overwrite?: { plan: OverwritePlan; epoch: string; cursor: Cursor; index: number; operationIds: string[]; fileIds: string[] };
 }
 export function newState(serverId: string, vaultId: string, clientId: string): SyncState {
-  return { schema: 1, serverId, vaultId, clientId, initialized: false, epoch: '', cursor: 0, remote: {}, entries: {}, pending: [], issues: {} };
+  return { schema: 1, treeVersion: 1, serverId, vaultId, clientId, initialized: false, epoch: '', cursor: 0, remote: {}, entries: {}, pending: [], issues: {} };
 }
 export interface Preview { upload: number; download: number; same: number; conflicts: number; local: number; remote: number }
 export interface EngineOptions { excludedPaths?: () => readonly string[]; configDir?: string }
@@ -49,34 +53,44 @@ export class Engine {
   private tail: Promise<unknown> = Promise.resolve();
   private running?: Promise<void>;
   private stopped = false;
+  private protectedRemoteDirectories = new Set<string>();
+  private protectRemote(files: FileState[]): void {
+    this.protectedRemoteDirectories.clear();
+    for (const file of files) for (const head of file.heads) if (!head.deleted && this.excludedByRule(head.path)) {
+      const parts = head.path.split('/'); parts.pop();
+      while (parts.length) { this.protectedRemoteDirectories.add(pathKey(parts.join('/'))); parts.pop(); }
+    }
+  }
+  private excludedByRule(path: string): boolean { return isExcluded(path, [...(this.state.serverExcludedPaths ?? []), ...normalizeExclusions([...(this.options.excludedPaths?.() ?? [])])], this.options.configDir); }
   constructor(readonly remote: Remote, readonly local: LocalVault, readonly state: SyncState,
     readonly save: (state: SyncState) => Promise<void>, readonly report: (message: string) => void = () => {}, readonly options: EngineOptions = {}) {
     if (state.schema !== 1 || state.vaultId !== remote.vaultId) throw new Error('本地同步状态不匹配，已停止');
     if (state.serverExcludedPaths !== undefined) state.serverExcludedPaths = normalizeExclusions(state.serverExcludedPaths);
   }
-  isExcluded(path: string): boolean { return isExcluded(path, [...(this.state.serverExcludedPaths ?? []), ...normalizeExclusions([...(this.options.excludedPaths?.() ?? [])])], this.options.configDir); }
+  isExcluded(path: string): boolean { return this.protectedRemoteDirectories.has(pathKey(path)) || !!this.local.protectedDirectories?.has(path) || this.excludedByRule(path); }
   private policy(rules?: string[]): void {
     // Older gateways omit this field. Keep the last durable policy on downgrade;
     // an explicit empty array is the only way to remove an existing policy.
     if (rules !== undefined || this.state.serverExcludedPaths === undefined) this.state.serverExcludedPaths = normalizeExclusions(rules ?? []);
   }
+  private kind(path: string): NodeKind { return this.local.kind?.(path) ?? 'file'; }
   private async scan(): Promise<Map<string, Buffer>> {
-    const files = await this.local.scan(path => !this.isExcluded(path));
+    const files = await this.local.scan(path => !this.excludedByRule(path));
     return new Map([...files].filter(([path]) => !this.isExcluded(path)));
   }
   async previewOverwrite(mode: OverwriteMode): Promise<OverwritePlan> {
     if (this.state.pending.length || Object.keys(this.state.issues).length) throw new Error('请先处理待上传内容和冲突，再执行覆盖');
     if (this.state.overwrite && this.state.overwrite.plan.mode !== mode) throw new Error('已有未完成的覆盖，请先完成原来的方向');
-    const snapshot = await this.remote.snapshot(); this.checkIdentity(snapshot); this.policy(snapshot.excludedPaths);
-    return planOverwrite(mode, await this.scan(), snapshot, path => this.isExcluded(path));
+    const snapshot = await this.remote.snapshot(); this.checkIdentity(snapshot); this.policy(snapshot.excludedPaths); this.protectRemote(snapshot.files);
+    return planOverwrite(mode, await this.scan(), snapshot, path => this.isExcluded(path), path => this.kind(path));
   }
   startOverwrite(plan: OverwritePlan): Promise<void> {
     return this.exclusive(async () => {
       if (this.stopped) throw new Error('同步已停止，请重新打开插件');
-      const snapshot = await this.remote.snapshot(); this.checkIdentity(snapshot); this.policy(snapshot.excludedPaths);
+      const snapshot = await this.remote.snapshot(); this.checkIdentity(snapshot); this.policy(snapshot.excludedPaths); this.protectRemote(snapshot.files);
       if (this.state.pending.length || Object.keys(this.state.issues).length) throw new Error('请先处理待上传内容和冲突，再执行覆盖');
       if (this.state.overwrite && this.state.overwrite.plan.mode !== plan.mode) throw new Error('已有未完成的覆盖，请先完成原来的方向');
-      const fresh = planOverwrite(plan.mode, await this.scan(), snapshot, path => this.isExcluded(path));
+      const fresh = planOverwrite(plan.mode, await this.scan(), snapshot, path => this.isExcluded(path), path => this.kind(path));
       if (fresh.fingerprint !== plan.fingerprint) throw new Error('预览后笔记或云端发生变化，请重新预览');
       await this.local.assertClosed?.(fresh.actions.map(a => a.path));
       this.state.overwrite = { plan: fresh, epoch: snapshot.epoch, cursor: snapshot.cursor, index: 0,
@@ -102,36 +116,37 @@ export class Engine {
       const action = job.plan.actions[job.index];
       if (this.isExcluded(action.path)) throw new Error('排除规则已变化，请重新预览覆盖');
       await this.local.assertClosed?.([action.path]);
-      const local = await this.local.read(action.path), currentHash = local === null ? null : hash(local);
+      const local = await this.local.read(action.path), currentHash = local === null ? null : hash(local), currentKind = this.kind(action.path);
       if (job.plan.mode === 'cloud-to-local') {
         const remote = await this.remote.snapshot(); this.checkIdentity(remote); this.policy(remote.excludedPaths);
         if (remote.epoch !== job.epoch || remote.cursor !== job.cursor || this.isExcluded(action.path)) throw new Error('云端已发生变化，请重新预览覆盖');
         const targetHash = action.type === 'delete-local' ? null : action.remote?.hash ?? null;
-        if (currentHash !== targetHash) {
-          if (currentHash !== action.localHash) throw new Error(`本地笔记已发生变化，请重新预览：${action.path}`);
+        if (currentHash !== targetHash || (local !== null && currentKind !== (action.kind ?? 'file'))) {
+          if (currentHash !== action.localHash || (local !== null && currentKind !== (action.localKind ?? 'file'))) throw new Error(`本地笔记已发生变化，请重新预览：${action.path}`);
           const content = action.type === 'delete-local' ? null : await this.remote.get(action.remote!.hash!);
-          await this.local.apply({oldPath: action.path, path: action.path, expectedHash: action.localHash, content});
+          await this.local.apply({oldPath: action.path, path: action.path, expectedHash: action.localHash, content, kind: action.kind, expectedKind: action.localKind});
         }
       } else {
-        if (currentHash !== action.localHash) throw new Error(`本地笔记已发生变化，请重新预览：${action.path}`);
+        if (action.type === 'upload' && (currentHash !== action.localHash || currentKind !== (action.kind ?? 'file'))) throw new Error(`本地文件已发生变化，请重新预览：${action.path}`);
         const deleted = action.type === 'delete-cloud', parents = action.remote ? [action.remote.id] : [];
         const revision: Revision = {id: job.operationIds[job.index], fileId: job.fileIds[job.index], parents,
-          path: action.path, deleted, hash: deleted ? null : currentHash, size: deleted ? 0 : local!.length, clientId: this.state.clientId};
+          path: action.path, ...(action.kind === 'directory' ? {kind: 'directory'} : {}), deleted, hash: deleted ? null : currentHash, size: deleted ? 0 : local!.length, clientId: this.state.clientId};
         if (!deleted) await this.remote.put(local!, currentHash!);
         await this.remote.commitStrict(revision, parents);
       }
       job.index++; await this.save(this.state);
       this.report(`正在覆盖 ${job.index}/${job.plan.actions.length}`);
     }
-    const final = await this.remote.snapshot(); this.checkIdentity(final); this.policy(final.excludedPaths);
-    const files = await this.scan(), remaining = planOverwrite(job.plan.mode, files, final, path => this.isExcluded(path));
+    const final = await this.remote.snapshot(); this.checkIdentity(final); this.policy(final.excludedPaths); this.protectRemote(final.files);
+    const files = await this.scan(), remaining = planOverwrite(job.plan.mode, files, final, path => this.isExcluded(path), path => this.kind(path));
     if (remaining.actions.length) throw new Error('覆盖期间两端发生变化，请重新预览并继续');
     const entries: Record<string, Entry> = Object.fromEntries(Object.entries(this.state.entries).filter(([, e]) => this.isExcluded(e.path)));
     const live = new Map(final.files.flatMap(f => f.heads.length === 1 && !f.heads[0].deleted ? [[pathKey(f.heads[0].path), f.heads[0]] as const] : []));
     for (const [path, bytes] of files) {
-      const head = live.get(pathKey(path)); if (!head || head.path !== path || head.hash !== hash(bytes)) throw new Error(`两端尚未一致，请重新预览：${path}`);
-      entries[head.fileId] = {fileId: head.fileId, path, basePath: path, baseRevision: head.id, baseHash: head.hash, baseDeleted: false, materialized: true};
+      const head = live.get(pathKey(path)); if (!head && this.kind(path) === 'directory' && [...live.keys()].some(p => p.startsWith(pathKey(path) + '/'))) continue; if (!head || head.path !== path || head.hash !== hash(bytes) || (head.kind ?? 'file') !== this.kind(path)) throw new Error(`两端尚未一致，请重新预览：${path}`);
+      entries[head.fileId] = {fileId: head.fileId, path, basePath: path, baseRevision: head.id, baseHash: head.hash, baseKind: head.kind ?? 'file', baseDeleted: false, materialized: true};
     }
+    this.rememberAbsentDeletions(files, final.files, entries);
     this.state.entries = entries; this.state.remote = Object.fromEntries(final.files.map(f => [f.fileId, f]));
     this.state.epoch = final.epoch; this.state.cursor = final.cursor; this.state.initialized = true; delete this.state.overwrite;
     this.state.issues = {}; await this.save(this.state); this.report('覆盖完成，已同步');
@@ -144,7 +159,7 @@ export class Engine {
   private checkIdentity(s: { serverId: string }) { if (s.serverId !== this.state.serverId) throw new Error('服务端身份已变化，请检查地址或备份恢复情况'); }
   private async snapshot(): Promise<void> {
     const s = await this.remote.snapshot(); this.checkIdentity(s);
-    this.policy(s.excludedPaths);
+    this.policy(s.excludedPaths); this.protectRemote(s.files);
     const bases = Object.values(this.state.entries).filter(e => !!e.baseRevision);
     const known = await this.remote.known([...new Set(bases.map(e => e.baseRevision!))]);
     for (const entry of bases) if (!known.has(entry.baseRevision!)) {
@@ -156,14 +171,14 @@ export class Engine {
   }
   async preview(): Promise<Preview> {
     const snapshot = await this.remote.snapshot(); this.checkIdentity(snapshot);
-    this.policy(snapshot.excludedPaths);
+    this.policy(snapshot.excludedPaths); this.protectRemote(snapshot.files);
     const files = await this.scan(), remoteFiles = snapshot.files.filter(file => !file.heads.some(head => this.isExcluded(head.path)));
     const result = { upload: 0, download: 0, same: 0, conflicts: 0, local: files.size, remote: remoteFiles.length };
     const matched = new Set<string>();
     for (const file of remoteFiles) {
       if (file.heads.length !== 1) { result.conflicts++; file.heads.forEach(h => matched.add(pathKey(h.path))); continue; }
       const head = file.heads[0], data = [...files].find(([p]) => pathKey(p) === pathKey(head.path));
-      if (data) { matched.add(pathKey(data[0])); if (!head.deleted && data[0] === head.path && hash(data[1]) === head.hash) result.same++; else result.conflicts++; }
+      if (data) { matched.add(pathKey(data[0])); if (!head.deleted && data[0] === head.path && hash(data[1]) === head.hash && this.kind(data[0]) === (head.kind ?? 'file')) result.same++; else result.conflicts++; }
       else if (!head.deleted) result.download++;
     }
     for (const path of files.keys()) if (!matched.has(pathKey(path))) result.upload++;
@@ -175,18 +190,37 @@ export class Engine {
       await this.snapshot();
       const files = await this.scan();
       for (const [path, data] of files) this.bindUntracked(path, data);
+      this.rememberAbsentDeletions(files, Object.values(this.state.remote), this.state.entries);
       this.state.initialized = true;
       await this.save(this.state);
     });
   }
+  private rememberAbsentDeletions(files: Map<string, Buffer>, remote: FileState[], entries: Record<string, Entry>): void {
+    // A verified absence is a baseline too. Preserve it so a later same-name
+    // creation descends from the deletion instead of looking like an offline copy.
+    const occupied = new Set([...files.keys(), ...Object.values(entries).map(e => e.path),
+      ...remote.flatMap(f => f.heads.filter(h => !h.deleted).map(h => h.path))].map(pathKey));
+    for (const file of remote) {
+      const head = file.heads[0];
+      if (file.heads.length !== 1 || !head.deleted || this.isExcluded(head.path) || occupied.has(pathKey(head.path))) continue;
+      entries[file.fileId] = {fileId: file.fileId, path: head.path, basePath: head.path,
+        baseRevision: head.id, baseHash: null, baseKind: head.kind ?? 'file', baseDeleted: true, materialized: true};
+      occupied.add(pathKey(head.path));
+    }
+  }
+  private hasRemoteChildren(path: string): boolean {
+    return Object.values(this.state.remote).some(f => f.heads.some(h => !h.deleted && pathKey(h.path).startsWith(pathKey(path) + '/')));
+  }
   private bindUntracked(path: string, data: Buffer): void {
-    const matches = Object.values(this.state.remote).filter(f => f.heads.some(h => pathKey(h.path) === pathKey(path)));
+    const candidates = Object.values(this.state.remote).filter(f => f.heads.some(h => pathKey(h.path) === pathKey(path)));
+    const live = candidates.filter(f => f.heads.some(h => !h.deleted)); const matches = live.length ? live : candidates.slice(-1);
     if (matches.length > 1) throw new Error(`远端路径存在多个身份：${path}`);
     const match = matches[0], fileId = match?.fileId ?? id(), head = match?.heads[0];
     if (this.state.entries[fileId]) throw new Error(`远端目标路径已有本地身份，请先处理移动冲突：${path}`);
-    const same = match?.heads.length === 1 && !head?.deleted && head?.path === path && head?.hash === hash(data);
+    const implicitDirectory = this.kind(path) === 'directory' && head?.deleted && this.hasRemoteChildren(path);
+    const same = implicitDirectory || match?.heads.length === 1 && !head?.deleted && head?.path === path && head?.hash === hash(data) && this.kind(path) === (head?.kind ?? 'file');
     this.state.entries[fileId] = { fileId, path, basePath: path, baseRevision: head?.id ?? null,
-      baseHash: match ? hash(data) : null, baseDeleted: false, materialized: true,
+      baseHash: match ? hash(data) : null, baseKind: this.kind(path), baseDeleted: !!implicitDirectory, materialized: true,
       ...(match && !same ? { blocked: '本地与远端同名但内容或版本不同，请选择保留版本' } : {}) };
   }
   noteRename(oldPath: string, path: string): Promise<void> {
@@ -216,6 +250,7 @@ export class Engine {
         if (page.more && page.cursor === this.state.cursor) throw new Error('远端分页游标未前进，已停止拉取');
         this.policy(page.excludedPaths);
         for (const event of page.changes) this.state.remote[event.file.fileId] = event.file;
+        this.protectRemote(Object.values(this.state.remote));
         this.state.cursor = page.cursor;
         await this.save(this.state); // Entire remote event payload is durable before advancing cursor.
         if (!page.more) break;
@@ -224,16 +259,21 @@ export class Engine {
   }
   private makePending(e: Entry, content: Buffer | null): Pending {
     return { revision: { id: id(), fileId: e.fileId, parents: e.baseRevision ? [e.baseRevision] : [],
-      path: e.path, deleted: content === null, hash: content === null ? null : hash(content), size: content?.length ?? 0, clientId: this.state.clientId },
+      path: e.path, ...((content === null ? e.baseKind : this.kind(e.path)) === 'directory' ? {kind: 'directory' as const} : {}), deleted: content === null, hash: content === null ? null : hash(content), size: content?.length ?? 0, clientId: this.state.clientId },
       content: content === null ? null : content.toString('base64') };
   }
   private async stage(): Promise<void> {
     const files = await this.scan();
+    this.rememberAbsentDeletions(files, Object.values(this.state.remote), this.state.entries);
     const tracked = new Set(Object.values(this.state.entries).map(e => pathKey(e.path)));
     for (const [path, data] of files) if (!tracked.has(pathKey(path))) this.bindUntracked(path, data);
     const deletions: Pending[] = [];
     for (const e of Object.values(this.state.entries)) {
       if (this.isExcluded(e.path)) continue;
+      // A path can be reused by a new identity after a type/case replacement.
+      // Its old tombstone must not re-upload the replacement's bytes.
+      if (e.baseDeleted && e.baseKind === 'directory' && this.hasRemoteChildren(e.path)) continue;
+      if (e.baseDeleted && Object.values(this.state.remote).some(f => f.fileId !== e.fileId && f.heads.some(h => !h.deleted && pathKey(h.path) === pathKey(e.path)))) continue;
       if (e.blocked && !e.materialized && !files.has(e.path)) delete e.blocked;
       if (e.blocked) { this.state.issues[e.fileId] = e.blocked; continue; }
       if (this.state.pending.some(p => p.revision.fileId === e.fileId)) continue;
@@ -245,7 +285,7 @@ export class Engine {
       if (data && !e.materialized) { e.blocked = '下载前本地出现同名文件，请选择保留版本'; this.state.issues[e.fileId] = e.blocked; continue; }
       if (data) {
         if (data.length > MAX_BYTES) throw new Error(`笔记超过 5 MiB：${e.path}`);
-        if (!e.baseRevision || e.baseDeleted || hash(data) !== e.baseHash || e.path !== e.basePath) this.state.pending.push(this.makePending(e, data));
+        if (!e.baseRevision || e.baseDeleted || hash(data) !== e.baseHash || this.kind(e.path) !== (e.baseKind ?? 'file') || e.path !== e.basePath) this.state.pending.push(this.makePending(e, data));
       } else if (e.materialized && !e.baseDeleted && e.baseRevision) deletions.push(this.makePending(e, null));
     }
     const count = Object.values(this.state.entries).filter(e => !e.baseDeleted && !this.isExcluded(e.path)).length;
@@ -263,10 +303,10 @@ export class Engine {
   private acknowledge(revision: Revision): void {
     const e = this.state.entries[revision.fileId];
     e.baseRevision = revision.id; e.basePath = revision.path; e.baseHash = revision.hash;
-    e.baseDeleted = revision.deleted; e.materialized = true; delete e.blocked;
+    e.baseKind = revision.kind ?? 'file'; e.baseDeleted = revision.deleted; e.materialized = true; delete e.blocked;
   }
   private async flush(): Promise<void> {
-    for (const pending of [...this.state.pending]) {
+    for (const pending of [...this.state.pending].sort((a,b) => Number(!a.revision.deleted)-Number(!b.revision.deleted) || (a.revision.deleted ? b.revision.path.split('/').length-a.revision.path.split('/').length : a.revision.path.split('/').length-b.revision.path.split('/').length))) {
       if (this.stopped) return;
       if (this.isExcluded(pending.revision.path) || this.isExcluded(this.state.entries[pending.revision.fileId]?.path ?? pending.revision.path)) continue;
       try {
@@ -293,10 +333,14 @@ export class Engine {
     const e = this.state.entries[job.fileId], r = job.revision;
     const target = await this.local.read(r.path);
     const old = e.path === r.path ? target : await this.local.read(e.path);
-    if ((r.deleted ? !old : !!target && hash(target) === r.hash && (e.path === r.path || !old))) {
+    if ((r.deleted ? !old : !!target && hash(target) === r.hash && this.kind(r.path) === (r.kind ?? 'file') && (e.path === r.path || !old))) {
       this.acknowledge(r); e.path = r.path;
     }
     delete this.state.applying; await this.save(this.state);
+  }
+  private isDirectoryMove(file: FileState): boolean {
+    const head = file.heads[0], entry = this.state.entries[file.fileId];
+    return !!head && !head.deleted && head.kind === 'directory' && !!entry && entry.path !== head.path;
   }
   private async applyRemote(): Promise<void> {
     const deletions = Object.values(this.state.remote).filter(f => f.heads.length === 1 && !this.isExcluded(f.heads[0].path) && !this.isExcluded(this.state.entries[f.fileId]?.path ?? f.heads[0].path) && f.heads[0].deleted &&
@@ -308,7 +352,7 @@ export class Engine {
       this.state.deletePlan = { fingerprint, paths: deletions.map(f => f.heads[0].path), direction: 'remote' };
       this.state.issues.__deletes__ = `远端批量删除保护：${deletions.length} 篇，等待确认`;
     }
-    for (const file of Object.values(this.state.remote)) {
+    for (const file of Object.values(this.state.remote).sort((a,b) => Number(this.isDirectoryMove(a)) - Number(this.isDirectoryMove(b)) || (this.isDirectoryMove(a) && this.isDirectoryMove(b) ? b.heads[0].path.split('/').length-a.heads[0].path.split('/').length : 0) || Number(!a.heads[0]?.deleted)-Number(!b.heads[0]?.deleted) || (a.heads[0]?.deleted ? b.heads[0].path.split('/').length-a.heads[0].path.split('/').length : a.heads[0].path.split('/').length-b.heads[0].path.split('/').length))) {
       if (this.stopped) return;
       let e = this.state.entries[file.fileId];
       if ((e && this.isExcluded(e.path)) || file.heads.some(head => this.isExcluded(head.path))) continue;
@@ -322,12 +366,13 @@ export class Engine {
       }
       if (e.blocked || this.state.pending.some(p => p.revision.fileId === e.fileId)) continue;
       if (e.baseRevision === r.id) continue;
+      if (r.deleted && r.kind === 'directory' && this.hasRemoteChildren(r.path)) { this.acknowledge(r); continue; }
       const content = r.deleted ? null : await this.remote.get(r.hash!);
       this.state.applying = { fileId: e.fileId, revision: r }; await this.save(this.state);
       try {
         const current = await this.local.read(e.path);
-        if (!(e.path === r.path && (content === null ? current === null : current !== null && hash(current) === r.hash))) {
-          await this.local.apply({ oldPath: e.path, path: r.path, expectedHash: e.materialized && !e.baseDeleted ? e.baseHash : null, content });
+        if (!(e.path === r.path && (content === null ? current === null : current !== null && hash(current) === r.hash && this.kind(r.path) === (r.kind ?? 'file')))) {
+          await this.local.apply({ oldPath: e.path, path: r.path, expectedHash: e.materialized && !e.baseDeleted ? e.baseHash : null, content, kind: r.kind, expectedKind: e.baseKind });
         }
         this.acknowledge(r); e.path = r.path;
       } catch (error) {
@@ -382,7 +427,7 @@ export class Engine {
       if (selected && selected.fileId !== fileId) throw new Error('历史版本身份不匹配');
       const content = choice === 'local' ? local : selected!.deleted ? null : await this.remote.get(selected!.hash!);
       const revision: Revision = { id: id(), fileId, parents: file.heads.map(h => h.id).sort(), path: selected?.path ?? e.path,
-        deleted: content === null, hash: content === null ? null : hash(content), size: content?.length ?? 0, clientId: this.state.clientId };
+        ...((selected ? selected.kind : local ? this.kind(e.path) : e.baseKind) === 'directory' ? {kind: 'directory' as const} : {}), deleted: content === null, hash: content === null ? null : hash(content), size: content?.length ?? 0, clientId: this.state.clientId };
       // Do not mutate the local baseline until downloaded bytes are safely applied.
       if (content !== null) await this.remote.put(content, revision.hash!);
       // Resolution operation must also be restartable if its response is lost.
@@ -390,7 +435,7 @@ export class Engine {
       this.state.pending.push({ revision, content: content === null ? null : content.toString('base64'), applyAfter: true });
       delete e.blocked;
       // Keep expected local bytes until reconcile, unlike normal upload acknowledgement.
-      e.baseHash = local ? hash(local) : null; e.baseDeleted = local === null; e.materialized = true;
+      e.baseKind = this.kind(e.path); e.baseHash = local ? hash(local) : null; e.baseDeleted = local === null; e.materialized = true;
       await this.save(this.state);
       // A resolution is published by normal flush, but its local application uses the preserved expectation.
       await this.flush();

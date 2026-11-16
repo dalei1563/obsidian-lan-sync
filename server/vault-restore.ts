@@ -1,4 +1,4 @@
-import { hash, pathsOverlap, SyncError, type FileState, type Revision, type Snapshot } from '../shared/protocol';
+import { hash, nodesOverlap, SyncError, type FileState, type Revision, type Snapshot } from '../shared/protocol';
 import { isExcluded } from '../shared/exclusions';
 
 export interface VaultRestoreAction { fileId: string; before: Revision; target: Revision | null; predelete: boolean }
@@ -6,7 +6,7 @@ export interface VaultRestorePlan { point: string; fingerprint: string; actions:
 
 function same(a: Revision, b: Revision | null): boolean {
   if (a.deleted && (!b || b.deleted)) return true;
-  return !!b && a.deleted === b.deleted && a.path === b.path && a.hash === b.hash && a.size === b.size;
+  return !!b && a.deleted === b.deleted && a.path === b.path && a.hash === b.hash && a.size === b.size && (a.kind ?? "file") === (b.kind ?? "file");
 }
 export function restoreFingerprint(snapshot: Snapshot): string {
   return hash(JSON.stringify({serverId: snapshot.serverId, rules: snapshot.excludedPaths ?? [], files: snapshot.files.map(f => [f.fileId, f.heads.map(h => h.id).sort()]).sort((a, b) => String(a[0]).localeCompare(String(b[0])))}));
@@ -20,7 +20,7 @@ export function planVaultRestore(point: string, snapshot: Snapshot, historical: 
     if (!file.heads[0].deleted) desired.push({fileId: file.fileId, head: file.heads[0]});
   }
   for (const file of snapshot.files) if (file.heads.some(h => isExcluded(h.path, snapshot.excludedPaths ?? []))) {
-    if (file.heads.some(h => !h.deleted && desired.some(d => d.fileId !== file.fileId && pathsOverlap(h.path, d.head.path)))) throw new SyncError('path_excluded', '历史路径被排除同步的文件占用，请先调整排除规则', 409);
+    if (file.heads.some(h => !h.deleted && desired.some(d => d.fileId !== file.fileId && nodesOverlap(h, d.head)))) throw new SyncError('path_excluded', '历史路径被排除同步的文件占用，请先调整排除规则', 409);
   }
   const actions: VaultRestoreAction[] = [];
   for (const file of snapshot.files) {
@@ -37,8 +37,9 @@ export function planVaultRestore(point: string, snapshot: Snapshot, historical: 
   // A gateway crash must leave every already-committed change at its final state.
   for (const d of desired) for (const file of snapshot.files) {
     if (file.fileId === d.fileId) continue;
-    const occupied = file.heads.some(h => !h.deleted && pathsOverlap(h.path, d.head.path));
+    const occupied = file.heads.some(h => !h.deleted && nodesOverlap(h, d.head));
     if (occupied && !actions.some(a => a.fileId === file.fileId && a.predelete)) throw new SyncError('restore_path_conflict', '历史路径被其他当前文件占用，请先处理文件重命名后重试', 409);
   }
+  actions.sort((a,b) => Number(!a.predelete)-Number(!b.predelete) || (a.predelete ? b.before.path.split('/').length-a.before.path.split('/').length : (a.target?.path ?? a.before.path).split('/').length-(b.target?.path ?? b.before.path).split('/').length));
   return {point, fingerprint: hash(JSON.stringify({point, current: restoreFingerprint(snapshot)})), actions};
 }

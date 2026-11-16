@@ -54,7 +54,8 @@ async function main() {
         if (command === 'invite' && !existsSync(defaultVault)) writeFileSync(defaultVault, result.vaultId, { flag: 'wx', mode: 0o600 });
         console.log(`Vault: ${result.vaultId}\nPairing code (single use, 10 minutes): ${result.code}`);
         if (command === 'invite') {
-          const i = invitationInstructions(option('url', process.env.SYNC_PUBLIC_URL ?? 'http://127.0.0.1:27123'), result.code);
+          const target = (await store.listVaults()).find(vault => vault.id === result.vaultId);
+          const i = invitationInstructions(option('url', process.env.SYNC_PUBLIC_URL ?? 'http://127.0.0.1:27123'), result.code, target && {id: target.id, name: target.name});
           console.log(`\nConnection code:\n${i.connection}\n\nWindows (run, then select the Vault if asked):\n${i.windowsCommand}\n\nmacOS (run, then select the Vault):\n${i.macCommand}`);
         }
       } else if (command === 'devices') {

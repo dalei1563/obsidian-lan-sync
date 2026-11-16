@@ -1,8 +1,8 @@
 {
   "name": "obsidian-lan-sync",
-  "version": "0.5.0",
+  "version": "0.6.2",
   "private": true,
-  "description": "Self-hosted Markdown synchronization service and Obsidian desktop plugin",
+  "description": "Self-hosted file and folder synchronization service and Obsidian desktop plugin",
   "engines": {
     "node": ">=24.15.0 <25"
   },
